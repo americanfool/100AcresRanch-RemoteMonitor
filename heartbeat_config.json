@@ -1,6 +1,6 @@
 {
   "target_ip": "100.125.102.77",
-  "retry_count": 2,
+  "retry_count": 1,
   "retry_delay": 1,
   "ping_interval_minutes": 5,
   "ping_interval_seconds": 0,
@@ -9,5 +9,6 @@
   "ssh_username": "100acresranch",
   "ssh_password": "100acresranch4120",
   "ssh_command": "python3 voltage.py",
-  "ssh_timeout": 1
+  "ssh_timeout": 1,
+  "close_to_tray": true
 }

@@ -115,9 +115,19 @@ class SettingsWindow:
         self.ssh_timeout_entry = ttk.Entry(ssh_frame, textvariable=self.ssh_timeout_var, width=10)
         self.ssh_timeout_entry.grid(row=5, column=1, sticky=tk.W, padx=(0, 10), pady=(5, 0))
         
+        # Application Settings
+        app_frame = ttk.LabelFrame(main_frame, text="Application Settings", padding="10")
+        app_frame.grid(row=2, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
+        app_frame.columnconfigure(1, weight=1)
+        
+        # Close to Tray
+        self.close_to_tray_var = tk.BooleanVar()
+        self.close_to_tray_check = ttk.Checkbutton(app_frame, text="Close to System Tray", variable=self.close_to_tray_var)
+        self.close_to_tray_check.grid(row=0, column=0, columnspan=2, sticky=tk.W)
+        
         # Buttons
         button_frame = ttk.Frame(main_frame)
-        button_frame.grid(row=2, column=0, columnspan=2, pady=(10, 0))
+        button_frame.grid(row=3, column=0, columnspan=2, pady=(10, 0))
         
         save_button = ttk.Button(button_frame, text="Save Settings", command=self.save_settings)
         save_button.pack(side=tk.LEFT, padx=(0, 10))
@@ -138,6 +148,7 @@ class SettingsWindow:
         self.ssh_password_var.set(self.config["ssh_password"])
         self.ssh_command_var.set(self.config["ssh_command"])
         self.ssh_timeout_var.set(str(self.config["ssh_timeout"]))
+        self.close_to_tray_var.set(self.config.get("close_to_tray", True))
     
     def save_settings(self):
         """Save settings and update main window"""
@@ -186,7 +197,8 @@ class SettingsWindow:
                 "ssh_username": self.ssh_username_var.get(),
                 "ssh_password": self.ssh_password_var.get(),
                 "ssh_command": self.ssh_command_var.get(),
-                "ssh_timeout": ssh_timeout
+                "ssh_timeout": ssh_timeout,
+                "close_to_tray": self.close_to_tray_var.get()
             })
             
             # Call save callback
@@ -217,7 +229,8 @@ class HeartbeatMonitor:
             "ssh_username": "",
             "ssh_password": "",
             "ssh_command": "",
-            "ssh_timeout": 10
+            "ssh_timeout": 10,
+            "close_to_tray": True
         }
         self.config = self.load_config()
         
@@ -1162,8 +1175,13 @@ class HeartbeatMonitor:
     
     def on_closing(self):
         """Handle window closing"""
-        # Hide to tray instead of closing
-        self.root.withdraw()
+        if self.config.get("close_to_tray", True):
+            # Hide to tray instead of closing
+            self.root.withdraw()
+        else:
+            # Ask user if they want to quit
+            if messagebox.askokcancel("Quit", "Do you want to quit the application?"):
+                self.quit_app()
 
 def main():
     root = tk.Tk()

@@ -27,4 +27,4 @@ re  # Built-in Python library
 
 # For system tray functionality
 pystray==0.19.4  # System tray icon library
-Pillow>=9.5.0  # Image processing for tray icons (compatible with Python 3.13) 
+Pillow==11.2.1  # Image processing for tray icons (compatible with Python 3.13) 

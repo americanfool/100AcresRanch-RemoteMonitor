@@ -45,16 +45,35 @@ python test_historical_data.py
 
 ## Configuration
 
-Edit `heartbeat_config.json` to configure:
-- Target IP address
-- Ping intervals
-- SSH connection settings
-- Retry parameters
+The application automatically creates `heartbeat_config.json` on first run with default settings. You can edit this file or use the Settings window in the application to configure:
+
+### Ping Settings
+- **Target IP**: IP address to ping (default: 8.8.8.8)
+- **Ping Interval**: Minutes and seconds between pings
+- **Retry Count**: Number of retry attempts
+- **Retry Delay**: Seconds between retries
+
+### SSH Settings
+- **Enable SSH**: Toggle SSH monitoring
+- **SSH Host**: Remote server IP
+- **SSH Username**: Login username
+- **SSH Password**: Login password
+- **SSH Command**: Command to execute (should return voltage)
+- **SSH Timeout**: Connection timeout in seconds
+
+### Application Settings
+- **Close to System Tray**: Whether to hide app to tray when closed
+
+> **Note**: `heartbeat_config.json` contains your personal settings and is ignored by git.
 
 ## Files
 
-- `heartbeat_monitor.py` - Main monitoring application
-- `test_historical_data.py` - Test app for historical data loading
-- `events_log.txt` - Event log file (auto-generated)
-- `heartbeat_config.json` - Configuration file
-- `requirements.txt` - Python dependencies 
+- `heartbeat_monitor.py` - Main monitoring application with tray support
+- `run.bat` - Windows launcher (installs dependencies and starts app)
+- `launcher.pyw` - Silent launcher (optional)
+- `requirements.txt` - Python dependencies
+- `README.md` - This documentation
+
+### Auto-Generated Files (ignored by git)
+- `heartbeat_config.json` - User configuration (created on first run)
+- `events_log.txt` - Event log (created during monitoring) 

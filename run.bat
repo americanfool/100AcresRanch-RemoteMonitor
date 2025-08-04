@@ -1,6 +1,6 @@
 @echo off
 echo Installing dependencies...
-pip install ping3 matplotlib paramiko pystray Pillow>=9.5.0 >nul 2>&1
+pip install ping3 matplotlib paramiko pystray Pillow==11.2.1 >nul 2>&1
 
 echo.
 echo Starting Heartbeat Monitor...
