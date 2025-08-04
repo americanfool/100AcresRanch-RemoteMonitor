@@ -4,6 +4,10 @@ heartbeat_config.json
 # Event logs
 events_log.txt
 
+# Application lock files
+.heartbeat_monitor.lock
+*.lock
+
 # Python cache files
 __pycache__/
 *.py[cod]

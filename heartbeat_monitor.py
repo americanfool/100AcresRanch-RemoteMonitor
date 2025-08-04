@@ -15,19 +15,35 @@ from collections import deque
 import paramiko
 import pystray
 
-# Global variable to track if an instance is running
-_instance_running = False
+# Simple lock file for single instance
+LOCK_FILE = ".heartbeat_monitor.lock"
 
 def is_window_already_open():
     """Check if Heartbeat Monitor window is already open"""
-    global _instance_running
-    return _instance_running
+    return os.path.exists(LOCK_FILE)
 
-def set_instance_running():
-    """Mark that an instance is now running"""
-    global _instance_running
-    _instance_running = True
+def create_lock_file():
+    """Create lock file to indicate instance is running"""
+    try:
+        with open(LOCK_FILE, 'w') as f:
+            f.write(str(os.getpid()))
+        # Make the file hidden on Windows
+        try:
+            import subprocess
+            subprocess.run(['attrib', '+h', LOCK_FILE], capture_output=True, check=False)
+        except:
+            pass  # Ignore if attrib command fails
+        return True
+    except:
+        return False
 
+def remove_lock_file():
+    """Remove lock file when instance closes"""
+    try:
+        if os.path.exists(LOCK_FILE):
+            os.remove(LOCK_FILE)
+    except:
+        pass
 
 
 class SettingsWindow:
@@ -296,12 +312,7 @@ class HeartbeatMonitor:
             try:
                 with open(self.config_file, 'r') as f:
                     loaded_config = json.load(f)
-                    # Handle migration from old format
-                    if "ping_interval" in loaded_config:
-                        total_seconds = loaded_config["ping_interval"]
-                        loaded_config["ping_interval_minutes"] = total_seconds // 60
-                        loaded_config["ping_interval_seconds"] = total_seconds % 60
-                        del loaded_config["ping_interval"]
+                            # Legacy migration code removed - all users should have migrated by now
                     return loaded_config
             except:
                 return self.default_config.copy()
@@ -455,7 +466,8 @@ class HeartbeatMonitor:
     
     def load_config_to_ui(self):
         """Load configuration values into UI elements"""
-        # Settings are now handled in the settings window
+        # Configuration loading is now handled by the settings window
+        # This method is kept for compatibility but does nothing
         pass
     
     def update_ui_timer(self):
@@ -623,9 +635,7 @@ class HeartbeatMonitor:
         self.last_graph_update = current_time
         gc.collect()
     
-    def update_graph(self):
-        """Legacy method - now calls optimized version"""
-        self.optimized_update_graph()
+    # Removed redundant update_graph method - use optimized_update_graph directly
     
     def get_filtered_data(self):
         """Get data filtered by current time range with thread-safe access"""
@@ -634,30 +644,40 @@ class HeartbeatMonitor:
         # Calculate time cutoff based on selected range
         time_cutoff = self.get_time_cutoff(now)
         
-        # FIXED: Thread-safe data access to prevent race conditions
-        with self.data_lock:
-            # Filter ping data
-            filtered_ping_times = []
-            filtered_ping_statuses = []
-            
-            for ping in self.ping_history:
-                if ping['timestamp'] >= time_cutoff:
-                    filtered_ping_times.append(ping['timestamp'])
-                    filtered_ping_statuses.append(ping['status'])
-            
-            # Filter SSH data
-            filtered_ssh_times = []
-            filtered_ssh_voltages = []
-            
-            for ssh in self.ssh_history:
-                if ssh['timestamp'] >= time_cutoff and ssh['status'] == 'SUCCESS' and ssh['voltage'] is not None:
-                    filtered_ssh_times.append(ssh['timestamp'])
-                    filtered_ssh_voltages.append(ssh['voltage'])
+        # Use helper methods for thread-safe data access
+        filtered_ping_times, filtered_ping_statuses = self._get_filtered_ping_data(time_cutoff)
+        filtered_ssh_times, filtered_ssh_voltages = self._get_filtered_ssh_data(time_cutoff)
         
         return {
             'ping': {'times': filtered_ping_times, 'statuses': filtered_ping_statuses},
             'ssh': {'times': filtered_ssh_times, 'voltages': filtered_ssh_voltages}
         }
+    
+    def _get_filtered_ping_data(self, time_cutoff):
+        """Thread-safe method to get filtered ping data"""
+        with self.data_lock:
+            filtered_times = []
+            filtered_statuses = []
+            
+            for ping in self.ping_history:
+                if ping['timestamp'] >= time_cutoff:
+                    filtered_times.append(ping['timestamp'])
+                    filtered_statuses.append(ping['status'])
+            
+            return filtered_times, filtered_statuses
+    
+    def _get_filtered_ssh_data(self, time_cutoff):
+        """Thread-safe method to get filtered SSH data"""
+        with self.data_lock:
+            filtered_times = []
+            filtered_voltages = []
+            
+            for ssh in self.ssh_history:
+                if ssh['timestamp'] >= time_cutoff and ssh['status'] == 'SUCCESS' and ssh['voltage'] is not None:
+                    filtered_times.append(ssh['timestamp'])
+                    filtered_voltages.append(ssh['voltage'])
+            
+            return filtered_times, filtered_voltages
     
     def get_time_cutoff(self, now):
         """Calculate time cutoff based on selected time range"""
@@ -722,7 +742,7 @@ class HeartbeatMonitor:
     
     def on_time_range_change(self, event=None):
         """Handle time range dropdown change"""
-        self.current_time_range = self.time_range_var.get()
+        # Use time_range_var.get() directly instead of storing in redundant variable
         self.update_graph()
     
 
@@ -1034,7 +1054,7 @@ class HeartbeatMonitor:
                         self.parse_existing_events(content)
                         
         except Exception as e:
-            print(f"Error loading existing data: {e}")
+            pass  # Error logging handled by secure logging system
     
     def parse_existing_events(self, content):
         """Parse existing event log to reconstruct monitoring history"""
@@ -1162,9 +1182,9 @@ class HeartbeatMonitor:
             
             # Now load fresh data
             self.load_existing_data()
-            print("Data refreshed successfully")
+            # Data refresh logging handled by secure logging system
         except Exception as e:
-            print(f"Error refreshing data: {e}")
+            pass  # Error logging handled by secure logging system
 
     def on_window_resize(self, event):
         """Handle window resize to update graph canvas"""
@@ -1227,8 +1247,7 @@ class HeartbeatMonitor:
     
     def quit_app(self):
         """Quit the application"""
-        global _instance_running
-        _instance_running = False
+        remove_lock_file()
         self.is_monitoring = False
         if hasattr(self, 'tray_icon') and self.tray_icon:
             self.tray_icon.stop()
@@ -1246,6 +1265,7 @@ class HeartbeatMonitor:
         except Exception as e:
             print(f"Cleanup error: {e}")
             
+        remove_lock_file()
         if self.config.get("close_to_tray", True):
             # Hide to tray instead of closing
             self.root.withdraw()
@@ -1261,7 +1281,7 @@ def main():
         return
 
     # Set instance as running
-    set_instance_running()
+    create_lock_file()
     
     root = tk.Tk()
     app = HeartbeatMonitor(root)

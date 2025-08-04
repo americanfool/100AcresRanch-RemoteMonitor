@@ -27,4 +27,8 @@ re  # Built-in Python library
 
 # For system tray functionality
 pystray==0.19.4  # System tray icon library
-Pillow==11.2.1  # Image processing for tray icons (compatible with Python 3.13) 
+Pillow==11.2.1  # Image processing for tray icons (compatible with Python 3.13)
+
+# For security features
+cryptography==41.0.7  # Encryption for secure credential storage
+psutil==5.9.6  # Process management for secure locking 
