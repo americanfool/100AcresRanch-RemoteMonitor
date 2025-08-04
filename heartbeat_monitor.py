@@ -20,13 +20,57 @@ LOCK_FILE = ".heartbeat_monitor.lock"
 
 def is_window_already_open():
     """Check if Heartbeat Monitor window is already open"""
-    return os.path.exists(LOCK_FILE)
+    if not os.path.exists(LOCK_FILE):
+        return False
+    
+    try:
+        # Read the PID from the lock file
+        with open(LOCK_FILE, 'r') as f:
+            pid_str = f.read().strip()
+            if not pid_str.isdigit():
+                # Invalid PID, remove stale lock file
+                remove_lock_file()
+                return False
+            
+            pid = int(pid_str)
+            
+            # Check if the process is actually running
+            try:
+                import psutil
+                if psutil.pid_exists(pid):
+                    # Process exists, check if it's our application
+                    try:
+                        process = psutil.Process(pid)
+                        if "python" in process.name().lower() and any("heartbeat_monitor" in cmd.lower() for cmd in process.cmdline()):
+                            return True
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        pass
+            except ImportError:
+                # psutil not available, fallback to basic check
+                try:
+                    os.kill(pid, 0)  # Check if process exists (doesn't actually kill)
+                    return True
+                except OSError:
+                    pass
+            
+            # Process not running, remove stale lock file
+            remove_lock_file()
+            return False
+            
+    except (IOError, ValueError):
+        # Lock file is corrupted or unreadable, remove it
+        remove_lock_file()
+        return False
+    
+    return False
 
 def create_lock_file():
     """Create lock file to indicate instance is running"""
     try:
-        with open(LOCK_FILE, 'w') as f:
+        # Use exclusive file creation to prevent race conditions
+        with open(LOCK_FILE, 'x') as f:
             f.write(str(os.getpid()))
+        
         # Make the file hidden on Windows
         try:
             import subprocess
@@ -34,7 +78,10 @@ def create_lock_file():
         except:
             pass  # Ignore if attrib command fails
         return True
-    except:
+    except FileExistsError:
+        # Another instance is already running
+        return False
+    except Exception:
         return False
 
 def remove_lock_file():
@@ -295,7 +342,7 @@ class HeartbeatMonitor:
         # Schedule a delayed graph update to ensure UI is fully initialized
         # This ensures historical data shows in the graph on startup
         if self.ping_history: # Only schedule if there's historical data
-            self.root.after(100, self.update_graph)
+            self.root.after(100, self.optimized_update_graph)
         
         # Bind resize event to update graph
         self.root.bind('<Configure>', self.on_window_resize)
@@ -743,7 +790,7 @@ class HeartbeatMonitor:
     def on_time_range_change(self, event=None):
         """Handle time range dropdown change"""
         # Use time_range_var.get() directly instead of storing in redundant variable
-        self.update_graph()
+        self.optimized_update_graph()
     
 
     
@@ -1161,7 +1208,7 @@ class HeartbeatMonitor:
         self.update_ssh_stats()
         self.update_current_streak()
         self.update_time_since_down()
-        self.update_graph()
+        self.optimized_update_graph()
     
     def clear_events(self):
         """Clear the events display"""
@@ -1189,7 +1236,7 @@ class HeartbeatMonitor:
     def on_window_resize(self, event):
         """Handle window resize to update graph canvas"""
         if self.is_monitoring:
-            self.update_graph()
+            self.optimized_update_graph()
     
     def create_tray_icon(self):
         """Create tray icon"""
@@ -1281,11 +1328,17 @@ def main():
         return
 
     # Set instance as running
-    create_lock_file()
+    if not create_lock_file():
+        print("Failed to create lock file. Another instance may be running.")
+        return
     
-    root = tk.Tk()
-    app = HeartbeatMonitor(root)
-    root.mainloop()
+    try:
+        root = tk.Tk()
+        app = HeartbeatMonitor(root)
+        root.mainloop()
+    finally:
+        # Ensure lock file is removed even if app crashes
+        remove_lock_file()
 
 if __name__ == "__main__":
     main() 
