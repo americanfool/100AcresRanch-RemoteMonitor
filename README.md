@@ -1,6 +1,6 @@
-# Heartbeat Sensor Monitor
+# HashBox Remote Monitor
 
-A real-time network monitoring application that tracks ping status and SSH voltage readings with historical data visualization.
+A real-time network monitoring application that tracks ping status and SSH voltage readings with historical data visualization for remote HashBox systems.
 
 ## Features
 
