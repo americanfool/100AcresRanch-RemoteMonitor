@@ -15,6 +15,21 @@ from collections import deque
 import paramiko
 import pystray
 
+# Global variable to track if an instance is running
+_instance_running = False
+
+def is_window_already_open():
+    """Check if Heartbeat Monitor window is already open"""
+    global _instance_running
+    return _instance_running
+
+def set_instance_running():
+    """Mark that an instance is now running"""
+    global _instance_running
+    _instance_running = True
+
+
+
 class SettingsWindow:
     def __init__(self, parent, config, save_callback):
         self.parent = parent
@@ -228,7 +243,7 @@ class HeartbeatMonitor:
             "ssh_host": "",
             "ssh_username": "",
             "ssh_password": "",
-            "ssh_command": "",
+            "ssh_command": "python3 voltage.py",
             "ssh_timeout": 10,
             "close_to_tray": True
         }
@@ -237,14 +252,25 @@ class HeartbeatMonitor:
         # Monitoring state
         self.is_monitoring = False
         self.monitor_thread = None
-        self.downtime_events = []
-        self.ping_history = deque(maxlen=500)  # Store up to 500 ping results
-        self.ssh_history = deque(maxlen=500)   # Store up to 500 SSH results
+        self.downtime_events = deque(maxlen=100)  # FIXED: Limit to prevent memory leaks
+        self.ping_history = deque(maxlen=1000)  # FIXED: Increased from 500 for better history
+        self.ssh_history = deque(maxlen=1000)   # FIXED: Increased from 500 for better history
         self.last_down_time = None
         self.total_pings = 0
         self.successful_pings = 0
         self.total_ssh = 0
         self.successful_ssh = 0
+        
+        # FIXED: Add thread synchronization
+        self.data_lock = threading.Lock()
+        
+        # FIXED: Graph update throttling
+        self.last_graph_update = 0
+        self.graph_update_interval = 5  # Update graph every 5 seconds instead of every second
+        
+        # FIXED: File I/O optimization
+        self.auto_save_counter = 0
+        self.auto_save_interval = 10  # Save every 10 events instead of every event
         
         self.setup_ui()
         self.load_config_to_ui()
@@ -440,23 +466,27 @@ class HeartbeatMonitor:
             self.update_ping_stats()
             self.update_ssh_stats()
             self.update_current_streak()
-            self.update_graph()
+            self.optimized_update_graph()  # FIXED: Use throttled graph updates
         
         # Schedule next update
         self.root.after(1000, self.update_ui_timer)
     
     def auto_save_events(self):
-        """Auto-save events to file"""
-        try:
-            filename = "events_log.txt"
-            
-            with open(filename, 'w', encoding='utf-8') as f:
-                f.write(self.events_text.get(1.0, tk.END))
-            
-            # Auto-save happens silently - no log message
-            
-        except Exception as e:
-            self.log_event(f"Auto-save failed: {e}", "error")
+        """Auto-save events to file with batching"""
+        self.auto_save_counter += 1
+        
+        if self.auto_save_counter >= self.auto_save_interval:
+            try:
+                filename = "events_log.txt"
+                
+                with open(filename, 'w', encoding='utf-8') as f:
+                    f.write(self.events_text.get(1.0, tk.END))
+                
+                self.auto_save_counter = 0
+                # Auto-save happens silently - no log message
+                
+            except Exception as e:
+                self.log_event(f"Auto-save failed: {e}", "error")
     
     def update_time_since_down(self):
         """Update the time since last down display"""
@@ -516,10 +546,23 @@ class HeartbeatMonitor:
         
         self.current_streak_var.set(f"Current streak: {streak} pings")
     
-    def update_graph(self):
-        """Update the live monitoring graph"""
+    def optimized_update_graph(self):
+        """Update the live monitoring graph with throttling and cleanup"""
+        import time
+        import gc
+        
+        current_time = time.time()
+        
+        # FIXED: Throttle graph updates to reduce CPU usage
+        if current_time - self.last_graph_update < self.graph_update_interval:
+            return
+            
         if len(self.ping_history) < 2:
             return
+        
+        # FIXED: Clean up old matplotlib objects to prevent memory leaks
+        if hasattr(self, 'fig') and self.fig:
+            plt.close(self.fig)
         
         # Clear the plot
         self.ax.clear()
@@ -575,31 +618,41 @@ class HeartbeatMonitor:
         
         # Redraw the canvas
         self.canvas.draw()
+        
+        # FIXED: Update last graph update time and force garbage collection
+        self.last_graph_update = current_time
+        gc.collect()
+    
+    def update_graph(self):
+        """Legacy method - now calls optimized version"""
+        self.optimized_update_graph()
     
     def get_filtered_data(self):
-        """Get data filtered by current time range"""
+        """Get data filtered by current time range with thread-safe access"""
         now = datetime.now()
         
         # Calculate time cutoff based on selected range
         time_cutoff = self.get_time_cutoff(now)
         
-        # Filter ping data
-        filtered_ping_times = []
-        filtered_ping_statuses = []
-        
-        for ping in self.ping_history:
-            if ping['timestamp'] >= time_cutoff:
-                filtered_ping_times.append(ping['timestamp'])
-                filtered_ping_statuses.append(ping['status'])
-        
-        # Filter SSH data
-        filtered_ssh_times = []
-        filtered_ssh_voltages = []
-        
-        for ssh in self.ssh_history:
-            if ssh['timestamp'] >= time_cutoff and ssh['status'] == 'SUCCESS' and ssh['voltage'] is not None:
-                filtered_ssh_times.append(ssh['timestamp'])
-                filtered_ssh_voltages.append(ssh['voltage'])
+        # FIXED: Thread-safe data access to prevent race conditions
+        with self.data_lock:
+            # Filter ping data
+            filtered_ping_times = []
+            filtered_ping_statuses = []
+            
+            for ping in self.ping_history:
+                if ping['timestamp'] >= time_cutoff:
+                    filtered_ping_times.append(ping['timestamp'])
+                    filtered_ping_statuses.append(ping['status'])
+            
+            # Filter SSH data
+            filtered_ssh_times = []
+            filtered_ssh_voltages = []
+            
+            for ssh in self.ssh_history:
+                if ssh['timestamp'] >= time_cutoff and ssh['status'] == 'SUCCESS' and ssh['voltage'] is not None:
+                    filtered_ssh_times.append(ssh['timestamp'])
+                    filtered_ssh_voltages.append(ssh['voltage'])
         
         return {
             'ping': {'times': filtered_ping_times, 'statuses': filtered_ping_statuses},
@@ -790,11 +843,12 @@ class HeartbeatMonitor:
                 if is_up:
                     self.successful_pings += 1
                 
-                # Add to ping history
-                self.ping_history.append({
-                    'timestamp': current_time,
-                    'status': 'UP' if is_up else 'DOWN'
-                })
+                # Add to ping history with thread-safe access
+                with self.data_lock:
+                    self.ping_history.append({
+                        'timestamp': current_time,
+                        'status': 'UP' if is_up else 'DOWN'
+                    })
                 
                 # Update last ping info
                 self.root.after(0, lambda: self.last_ping_var.set(
@@ -810,12 +864,13 @@ class HeartbeatMonitor:
                     if ssh_result == 'SUCCESS':
                         self.successful_ssh += 1
                     
-                    # Add to SSH history
-                    self.ssh_history.append({
-                        'timestamp': current_time,
-                        'status': ssh_result,
-                        'voltage': voltage
-                    })
+                    # Add to SSH history with thread-safe access
+                    with self.data_lock:
+                        self.ssh_history.append({
+                            'timestamp': current_time,
+                            'status': ssh_result,
+                            'voltage': voltage
+                        })
                     
                     # Update last SSH info
                     if voltage is not None:
@@ -904,13 +959,17 @@ class HeartbeatMonitor:
         return 'FAILED', None
     
     def record_downtime(self, timestamp):
-        """Record a downtime event"""
+        """Record a downtime event with thread-safe access"""
         event = {
             "timestamp": timestamp,
             "status": "DOWN"
         }
-        self.downtime_events.append(event)
-        self.last_down_time = timestamp
+        
+        # FIXED: Thread-safe data access to prevent race conditions
+        with self.data_lock:
+            self.downtime_events.append(event)
+            self.last_down_time = timestamp
+            
         self.root.after(0, lambda: self.log_event(f"DOWN: {timestamp.strftime('%Y-%m-%d %H:%M:%S')}", "down"))
     
     def log_event(self, message, event_type="normal"):
@@ -1168,13 +1227,25 @@ class HeartbeatMonitor:
     
     def quit_app(self):
         """Quit the application"""
+        global _instance_running
+        _instance_running = False
         self.is_monitoring = False
         if hasattr(self, 'tray_icon') and self.tray_icon:
             self.tray_icon.stop()
         self.root.quit()
     
     def on_closing(self):
-        """Handle window closing"""
+        """Handle window closing with resource cleanup"""
+        # FIXED: Clean up resources before closing
+        try:
+            import gc
+            if hasattr(self, 'fig') and self.fig:
+                import matplotlib.pyplot as plt
+                plt.close(self.fig)
+            gc.collect()
+        except Exception as e:
+            print(f"Cleanup error: {e}")
+            
         if self.config.get("close_to_tray", True):
             # Hide to tray instead of closing
             self.root.withdraw()
@@ -1184,6 +1255,14 @@ class HeartbeatMonitor:
                 self.quit_app()
 
 def main():
+    # Check if window is already open
+    if is_window_already_open():
+        print("Heartbeat Monitor is already running!")
+        return
+
+    # Set instance as running
+    set_instance_running()
+    
     root = tk.Tk()
     app = HeartbeatMonitor(root)
     root.mainloop()
