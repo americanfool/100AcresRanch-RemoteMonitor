@@ -1,27 +1,27 @@
 {
   "target_ip": "100.125.102.77",
-  "retry_count": 1,
-  "retry_delay": 1,
-  "ping_interval_minutes": 0,
-  "ping_interval_seconds": 5,
+  "retry_count": 2,
+  "retry_delay": 2,
+  "ping_interval_minutes": 5,
+  "ping_interval_seconds": 0,
   "ssh_enabled": true,
   "ssh_host": "100.125.102.77",
   "ssh_username": "100acresranch",
   "ssh_password": "100acresranch4120",
   "ssh_command": "python3 voltage.py",
-  "ssh_timeout": 1,
+  "ssh_timeout": 10,
   "close_to_tray": true,
   "metrics_enabled": {
     "temperature": true,
     "frequency": true,
     "terahash": true,
-    "fan_speed": true,
+    "fan_speed": false,
     "ping": true,
     "ssh_voltage": true,
     "power": true
   },
-  "api_port": 8080,
-  "api_timeout": 1,
+  "api_port": 4028,
+  "api_timeout": 2,
   "temp_endpoint": "{\"command\":\"temps\"}",
   "temp_path": "TEMPS.0.TEMP",
   "th_endpoint": "{\"command\":\"stats\"}",
@@ -32,5 +32,22 @@
   "fan_path": "FANS",
   "power_endpoint": "{\"command\":\"power\"}",
   "power_path": "POWER.0.Watts",
-  "miner_ip": "192.168.168.226"
+  "miner_ip": "192.168.168.226",
+  "metrics_display": {
+    "frequency": true,
+    "ssh_voltage": true,
+    "ping": true,
+    "terahash": true,
+    "power": true,
+    "fan_speed": true,
+    "temperature": true
+  },
+  "api_calls_enabled": {
+    "temperature": true,
+    "terahash": true,
+    "frequency": true,
+    "fan_speed": true,
+    "power": true
+  },
+  "ssh_via_worker": true
 }

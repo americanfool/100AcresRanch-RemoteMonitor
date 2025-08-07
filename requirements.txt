@@ -1,11 +1,11 @@
 # GUI framework for the heartbeat monitor interface
 tkinter  # Built-in Python library, no pip install needed
 
-# For ping functionality and network operations
-ping3==4.0.4  # Cross-platform ping library
-
 # For SSH functionality
 paramiko==3.3.1  # SSH library for Python
+
+# For HTTP API requests (miner metrics)
+requests==2.31.0  # HTTP library for API calls
 
 # For live graph visualization
 matplotlib==3.7.2  # Plotting library for live uptime graph

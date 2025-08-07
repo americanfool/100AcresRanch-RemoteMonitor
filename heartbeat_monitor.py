@@ -6,7 +6,8 @@ import json
 import os
 import re
 from datetime import datetime, timedelta
-from ping3 import ping
+import platform
+import subprocess
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
@@ -43,7 +44,7 @@ def is_window_already_open():
                     # Process exists, check if it's our application
                     try:
                         process = psutil.Process(pid)
-                        if "python" in process.name().lower() and any("heartbeat_monitor" in cmd.lower() for cmd in process.cmdline()):
+                        if ("python" in process.name().lower() or "heartbeat" in process.name().lower()) and any("heartbeat_monitor" in str(cmd).lower() for cmd in process.cmdline()):
                             return True
                     except (psutil.NoSuchProcess, psutil.AccessDenied):
                         pass
@@ -75,8 +76,15 @@ def create_lock_file():
         
         # Make the file hidden on Windows
         try:
-            import subprocess
-            subprocess.run(['attrib', '+h', LOCK_FILE], capture_output=True, check=False)
+            if platform.system().lower() == 'windows':
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                startupinfo.wShowWindow = subprocess.SW_HIDE
+                subprocess.run(['attrib', '+h', LOCK_FILE], 
+                             capture_output=True, 
+                             check=False,
+                             startupinfo=startupinfo,
+                             creationflags=0x08000000)  # CREATE_NO_WINDOW value
         except:
             pass  # Ignore if attrib command fails
         return True
@@ -93,6 +101,48 @@ def remove_lock_file():
             os.remove(LOCK_FILE)
     except:
         pass
+
+
+def ping(host, timeout=2):
+    """
+    Ping a host using subprocess for better Windows compatibility.
+    Returns True if host is reachable, False otherwise.
+    """
+    try:
+        # Determine the correct ping command based on the OS
+        param = '-n' if platform.system().lower() == 'windows' else '-c'
+        timeout_param = '-w' if platform.system().lower() == 'windows' else '-W'
+        
+        # Build the command
+        command = ['ping', param, '1', timeout_param, str(int(timeout * 1000)), host]
+        
+        # Configure subprocess to hide console window on Windows
+        startupinfo = None
+        creationflags = 0
+        if platform.system().lower() == 'windows':
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = subprocess.SW_HIDE
+            # CREATE_NO_WINDOW flag - use the value directly for compatibility
+            creationflags = 0x08000000  # subprocess.CREATE_NO_WINDOW value
+        
+        # Execute ping command
+        result = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout + 1,
+            text=True,
+            startupinfo=startupinfo,
+            creationflags=creationflags
+        )
+        
+        # Return True if ping was successful (return code 0)
+        return result.returncode == 0
+    except subprocess.TimeoutExpired:
+        return False
+    except Exception:
+        return False
 
 
 class BaseMetric(ABC):
@@ -142,7 +192,7 @@ class PingMetric(BaseMetric):
             for attempt in range(self.config.get("retry_count", 4) + 1):
                 try:
                     result = ping(self.config.get("target_ip", "8.8.8.8"), timeout=2)
-                    if result is not None:
+                    if result:
                         return True, "UP"
                 except:
                     pass
@@ -179,38 +229,56 @@ class SSHVoltageMetric(BaseMetric):
         """Collect SSH voltage data using existing SSH logic"""
         if not self.config.get("ssh_enabled", False):
             return False, None
-            
-        try:
-            for attempt in range(self.config.get("retry_count", 4) + 1):
+
+        host = self.config.get("ssh_host", self.config.get("target_ip", ""))
+        username = self.config.get("ssh_username", "")
+        password = self.config.get("ssh_password", "")
+        ssh_timeout = int(self.config.get("ssh_timeout", 10))
+        retries = int(self.config.get("retry_count", 0))
+        delay = float(self.config.get("retry_delay", 1))
+
+        for attempt in range(retries + 1):
+            try:
+                ssh = paramiko.SSHClient()
+                ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                ssh.connect(hostname=host, username=username, password=password,
+                            timeout=ssh_timeout, allow_agent=False, look_for_keys=False)
+                _, stdout, stderr = ssh.exec_command(
+                    self.config.get("ssh_command", "python3 voltage.py"),
+                    timeout=ssh_timeout
+                )
+                # Ensure command completion and robust read
                 try:
-                    ssh = paramiko.SSHClient()
-                    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-                    
-                    ssh.connect(
-                        self.config.get("ssh_host", self.config.get("target_ip", "")),  # Use ssh_host or fallback to target_ip
-                        username=self.config.get("ssh_username", ""),
-                        password=self.config.get("ssh_password", ""),
-                        timeout=self.config.get("ssh_timeout", 10)
-                    )
-                    
-                    stdin, stdout, stderr = ssh.exec_command(self.config.get("ssh_command", "python3 voltage.py"))
-                    output = stdout.read().decode().strip()
-                    ssh.close()
-                    
-                    # Parse voltage from output
-                    voltage = float(output)
-                    if self.validate_value(voltage):
-                        return True, voltage
-                    else:
-                        return False, None
-                        
-                except Exception as e:
-                    if attempt < self.config.get("retry_count", 4):
-                        time.sleep(self.config.get("retry_delay", 2))
-            
-            return False, None
-        except Exception:
-            return False, None
+                    stdout.channel.settimeout(ssh_timeout)
+                except Exception:
+                    pass
+                try:
+                    _ = stdout.channel.recv_exit_status()
+                except Exception:
+                    pass
+                output = stdout.read().decode(errors="ignore").strip()
+                if not output and hasattr(stdout, 'channel') and stdout.channel.recv_ready():
+                    try:
+                        output = stdout.channel.recv(1024).decode(errors="ignore").strip()
+                    except Exception:
+                        pass
+                if not output:
+                    errtxt = ''
+                    try:
+                        errtxt = stderr.read().decode(errors="ignore").strip()
+                    except Exception:
+                        pass
+                    if errtxt:
+                        raise Exception(errtxt)
+                ssh.close()
+
+                voltage = float(output)
+                return (True, voltage) if self.validate_value(voltage) else (False, None)
+            except Exception as e:
+                self.last_error = str(e)
+                if attempt < retries:
+                    time.sleep(delay)
+        return False, None
     
     def validate_value(self, value):
         """Validate voltage value"""
@@ -242,11 +310,11 @@ class APIMetric(BaseMetric):
         try:
             import socket
             import json
-            
+
             # Use custom command from config if available
             command_key = f"{self.name.replace('_', '')}_endpoint"
             path_key = f"{self.name.replace('_', '')}_path"
-            
+
             # Map metric names to config keys
             if self.name == "temperature":
                 command_key = "temp_endpoint"
@@ -263,46 +331,69 @@ class APIMetric(BaseMetric):
             elif self.name == "power":
                 command_key = "power_endpoint"
                 path_key = "power_path"
-            
+
             command = self.config.get(command_key, self.endpoint)
             value_path = self.config.get(path_key, self.value_path)
-            
+
             # Skip if command is empty (disabled)
             if not command or not command.strip():
                 return False, None
-            
+
             # Get miner IP (separate from monitoring Pi IP)
             host = self.config.get("miner_ip", "192.168.168.226")
             port = self.config.get("api_port", 4028)
-            
-            # Create socket and send command
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.settimeout(self.config.get("api_timeout", 10))
-                s.connect((host, int(port)))
-                s.sendall(command.encode())
-                
-                # Receive response (miner API doesn't use newlines)
-                response = s.recv(8192)
-            
-            # Parse JSON response
-            response_str = response.decode('utf-8', errors='ignore')
-            # Clean up response
-            response_str = response_str.replace('\x00', '')
-            # Find JSON start if needed
-            if '{' in response_str:
-                json_start = response_str.index('{')
-                response_str = response_str[json_start:]
-            
-            data = json.loads(response_str)
-            
-            # Extract value using path
-            value = self._extract_value(data, value_path)
-            if value is not None and self.validate_value(value):
-                return True, value
-            else:
-                return False, None
-                
-        except Exception as e:
+
+            # Global retry settings (apply to API too)
+            retries = int(self.config.get("retry_count", 0))
+            delay = float(self.config.get("retry_delay", 1))
+
+            for attempt in range(retries + 1):
+                try:
+                    # Create socket and send command
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                        s.settimeout(self.config.get("api_timeout", 10))
+                        s.connect((host, int(port)))
+                        s.sendall(command.encode())
+
+                        # Robust receive loop: read until socket closes or timeout
+                        chunks = []
+                        while True:
+                            try:
+                                chunk = s.recv(8192)
+                                if not chunk:
+                                    break
+                                chunks.append(chunk)
+                                if b"\x00" in chunk:
+                                    break
+                            except socket.timeout:
+                                break
+
+                    # Parse JSON response
+                    response_bytes = b"".join(chunks)
+                    response_str = response_bytes.decode('utf-8', errors='ignore').replace('\x00', '')
+                    if '{' in response_str:
+                        json_start = response_str.index('{')
+                        response_str = response_str[json_start:]
+
+                    data = json.loads(response_str)
+
+                    # Extract value using path
+                    value = self._extract_value(data, value_path)
+                    if value is not None and self.validate_value(value):
+                        return True, value
+                    # If parse/validate failed, fall through to retry
+                except Exception:
+                    # try again if attempts remain
+                    pass
+
+                if attempt < retries:
+                    try:
+                        time.sleep(delay)
+                    except Exception:
+                        pass
+
+            return False, None
+        except Exception:
             return False, None
     
     def _extract_value(self, data, path):
@@ -530,11 +621,24 @@ class MetricsManager:
         return [metric for metric in self.metrics.values() if metric.enabled]
     
     def collect_all_data(self, config):
-        """Collect data for all enabled metrics"""
+        """Collect data for all metrics (based on API call settings)"""
         results = {}
-        for metric in self.get_enabled_metrics():
+        for metric in self.metrics.values():
+            # Check if this metric should collect data
+            if metric.name == 'ping':
+                # Always collect ping (it's core functionality)
+                should_collect = True
+            elif metric.name == 'ssh_voltage':
+                # Always collect SSH voltage in main loop
+                should_collect = True
+            else:
+                # For API metrics, check api_calls_enabled setting
+                should_collect = config.get("api_calls_enabled", {}).get(metric.name, False)
+            
+            if not should_collect:
+                continue
             # Update metric config
-            metric.config = {k: v for k, v in config.items() if k.startswith(f"{metric.name}_") or k in ["api_url", "api_token", "api_timeout", "target_ip", "retry_count", "retry_delay", "ssh_host", "ssh_username", "ssh_password", "ssh_command", "ssh_timeout"]}
+            metric.config = {k: v for k, v in config.items() if k.startswith(f"{metric.name}_") or k in ["api_url", "api_token", "api_timeout", "target_ip", "retry_count", "retry_delay", "ssh_host", "ssh_username", "ssh_password", "ssh_command", "ssh_timeout", "ssh_enabled"]}
             
             success, value = metric.collect_data()
             results[metric.name] = {
@@ -551,6 +655,13 @@ class MetricsManager:
                         'timestamp': datetime.now(),
                         'value': value
                     })
+            
+            # Add very small delay between API calls only (not for ping)
+            if metric.name not in ['ping', 'ssh_voltage'] and should_collect:
+                try:
+                    time.sleep(0.1)  # Reduced from 0.5 to 0.1 for less blocking
+                except Exception:
+                    pass
         
         return results
 
@@ -586,6 +697,11 @@ class SettingsWindow:
         canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
         canvas.configure(yscrollcommand=scrollbar.set)
         
+        # Bind mouse wheel to canvas for scrolling
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        
         # Main frame inside scrollable area
         main_frame = ttk.Frame(scrollable_frame, padding="10")
         main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
@@ -599,44 +715,34 @@ class SettingsWindow:
         canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
         
-        # Host Configuration (at the top)
-        host_frame = ttk.LabelFrame(main_frame, text="Host Configuration", padding="10")
-        host_frame.grid(row=0, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
-        host_frame.columnconfigure(1, weight=1)
+        # Host Configuration removed; SSH IP moved into SSH section
         
-        # Target Host/IP (used for ping, SSH, and API)
-        ttk.Label(host_frame, text="Target Host/IP:").grid(row=0, column=0, sticky=tk.W, padx=(0, 10))
-        self.ip_var = tk.StringVar()
-        self.ip_entry = ttk.Entry(host_frame, textvariable=self.ip_var, width=30)
-        self.ip_entry.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=(0, 10))
-        ttk.Label(host_frame, text="(Used for Ping, SSH, and API calls)").grid(row=1, column=1, sticky=tk.W, padx=(0, 10))
+        # Global Settings Configuration (applies to all operations)
+        global_frame = ttk.LabelFrame(main_frame, text="Global Settings (All Operations)", padding="10")
+        global_frame.grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
+        global_frame.columnconfigure(1, weight=1)
         
-        # Ping Configuration
-        ping_frame = ttk.LabelFrame(main_frame, text="Ping Configuration", padding="10")
-        ping_frame.grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
-        ping_frame.columnconfigure(1, weight=1)
-        
-        # Ping interval - Minutes
-        ttk.Label(ping_frame, text="Ping Interval (minutes):").grid(row=1, column=0, sticky=tk.W, padx=(0, 10), pady=(10, 0))
+        # Monitoring interval - Minutes
+        ttk.Label(global_frame, text="Monitoring Interval (minutes):").grid(row=1, column=0, sticky=tk.W, padx=(0, 10), pady=(10, 0))
         self.interval_minutes_var = tk.StringVar()
-        self.interval_minutes_entry = ttk.Entry(ping_frame, textvariable=self.interval_minutes_var, width=10)
+        self.interval_minutes_entry = ttk.Entry(global_frame, textvariable=self.interval_minutes_var, width=10)
         self.interval_minutes_entry.grid(row=1, column=1, sticky=tk.W, padx=(0, 10), pady=(10, 0))
         
-        # Ping interval - Seconds
-        ttk.Label(ping_frame, text="Ping Interval (seconds):").grid(row=2, column=0, sticky=tk.W, padx=(0, 10), pady=(10, 0))
+        # Monitoring interval - Seconds
+        ttk.Label(global_frame, text="Monitoring Interval (seconds):").grid(row=2, column=0, sticky=tk.W, padx=(0, 10), pady=(10, 0))
         self.interval_seconds_var = tk.StringVar()
-        self.interval_seconds_entry = ttk.Entry(ping_frame, textvariable=self.interval_seconds_var, width=10)
+        self.interval_seconds_entry = ttk.Entry(global_frame, textvariable=self.interval_seconds_var, width=10)
         self.interval_seconds_entry.grid(row=2, column=1, sticky=tk.W, padx=(0, 10), pady=(10, 0))
         
-        # Retry settings
-        ttk.Label(ping_frame, text="Retry Count:").grid(row=3, column=0, sticky=tk.W, padx=(0, 10), pady=(10, 0))
+        # Global retry settings (used by all operations)
+        ttk.Label(global_frame, text="Retry Count (all operations):").grid(row=3, column=0, sticky=tk.W, padx=(0, 10), pady=(10, 0))
         self.retry_count_var = tk.StringVar()
-        self.retry_count_entry = ttk.Entry(ping_frame, textvariable=self.retry_count_var, width=10)
+        self.retry_count_entry = ttk.Entry(global_frame, textvariable=self.retry_count_var, width=10)
         self.retry_count_entry.grid(row=3, column=1, sticky=tk.W, padx=(0, 10), pady=(10, 0))
         
-        ttk.Label(ping_frame, text="Retry Delay (seconds):").grid(row=4, column=0, sticky=tk.W, padx=(0, 10), pady=(10, 0))
+        ttk.Label(global_frame, text="Retry Delay (all operations):").grid(row=4, column=0, sticky=tk.W, padx=(0, 10), pady=(10, 0))
         self.retry_delay_var = tk.StringVar()
-        self.retry_delay_entry = ttk.Entry(ping_frame, textvariable=self.retry_delay_var, width=10)
+        self.retry_delay_entry = ttk.Entry(global_frame, textvariable=self.retry_delay_var, width=10)
         self.retry_delay_entry.grid(row=4, column=1, sticky=tk.W, padx=(0, 10), pady=(10, 0))
         
         # SSH Configuration
@@ -649,32 +755,34 @@ class SettingsWindow:
         self.ssh_check = ttk.Checkbutton(ssh_frame, text="Enable SSH Monitoring", variable=self.ssh_enabled_var)
         self.ssh_check.grid(row=0, column=0, columnspan=2, sticky=tk.W, pady=(0, 10))
         
-        # SSH Username (Host will use the main Target Host/IP)
-        ttk.Label(ssh_frame, text="SSH Username:").grid(row=1, column=0, sticky=tk.W, padx=(0, 10), pady=(5, 0))
+        # SSH IP (used for Ping and SSH)
+        ttk.Label(ssh_frame, text="SSH IP:").grid(row=1, column=0, sticky=tk.W, padx=(0, 10), pady=(5, 0))
+        self.ip_var = tk.StringVar()
+        self.ip_entry = ttk.Entry(ssh_frame, textvariable=self.ip_var, width=20)
+        self.ip_entry.grid(row=1, column=1, sticky=(tk.W, tk.E), padx=(0, 10), pady=(5, 0))
+
+        # SSH Username
+        ttk.Label(ssh_frame, text="SSH Username:").grid(row=2, column=0, sticky=tk.W, padx=(0, 10), pady=(5, 0))
         self.ssh_username_var = tk.StringVar()
         self.ssh_username_entry = ttk.Entry(ssh_frame, textvariable=self.ssh_username_var, width=20)
-        self.ssh_username_entry.grid(row=1, column=1, sticky=(tk.W, tk.E), padx=(0, 10), pady=(5, 0))
+        self.ssh_username_entry.grid(row=2, column=1, sticky=(tk.W, tk.E), padx=(0, 10), pady=(5, 0))
         
         # SSH Password
-        ttk.Label(ssh_frame, text="SSH Password:").grid(row=2, column=0, sticky=tk.W, padx=(0, 10), pady=(5, 0))
+        ttk.Label(ssh_frame, text="SSH Password:").grid(row=3, column=0, sticky=tk.W, padx=(0, 10), pady=(5, 0))
         self.ssh_password_var = tk.StringVar()
         self.ssh_password_entry = ttk.Entry(ssh_frame, textvariable=self.ssh_password_var, width=20, show="*")
-        self.ssh_password_entry.grid(row=2, column=1, sticky=(tk.W, tk.E), padx=(0, 10), pady=(5, 0))
+        self.ssh_password_entry.grid(row=3, column=1, sticky=(tk.W, tk.E), padx=(0, 10), pady=(5, 0))
         
         # SSH Command
-        ttk.Label(ssh_frame, text="SSH Command:").grid(row=3, column=0, sticky=tk.W, padx=(0, 10), pady=(5, 0))
+        ttk.Label(ssh_frame, text="SSH Command:").grid(row=4, column=0, sticky=tk.W, padx=(0, 10), pady=(5, 0))
         self.ssh_command_var = tk.StringVar()
         self.ssh_command_entry = ttk.Entry(ssh_frame, textvariable=self.ssh_command_var, width=40)
-        self.ssh_command_entry.grid(row=3, column=1, sticky=(tk.W, tk.E), padx=(0, 10), pady=(5, 0))
+        self.ssh_command_entry.grid(row=4, column=1, sticky=(tk.W, tk.E), padx=(0, 10), pady=(5, 0))
         
-        # SSH Timeout
-        ttk.Label(ssh_frame, text="SSH Timeout (seconds):").grid(row=4, column=0, sticky=tk.W, padx=(0, 10), pady=(5, 0))
-        self.ssh_timeout_var = tk.StringVar()
-        self.ssh_timeout_entry = ttk.Entry(ssh_frame, textvariable=self.ssh_timeout_var, width=10)
-        self.ssh_timeout_entry.grid(row=4, column=1, sticky=tk.W, padx=(0, 10), pady=(5, 0))
+        # SSH Timeout (uses global retry settings)
         
         # API Metrics Configuration
-        api_frame = ttk.LabelFrame(main_frame, text="API Metrics (Optional) - Uses Target Host", padding="10")
+        api_frame = ttk.LabelFrame(main_frame, text="API Metrics (Optional)", padding="10")
         api_frame.grid(row=3, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
         api_frame.columnconfigure(1, weight=1)
         
@@ -696,13 +804,30 @@ class SettingsWindow:
         self.api_timeout_entry = ttk.Entry(api_frame, textvariable=self.api_timeout_var, width=10)
         self.api_timeout_entry.grid(row=2, column=1, sticky=tk.W, padx=(0, 10), pady=(5, 0))
         
+        # API Calls Enable/Disable
+        api_enable_frame = ttk.LabelFrame(api_frame, text="Enable API Calls")
+        api_enable_frame.grid(row=3, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(5, 10))
+        
+        # API call enable checkboxes
+        self.api_temp_enabled_var = tk.BooleanVar()
+        self.api_th_enabled_var = tk.BooleanVar()
+        self.api_freq_enabled_var = tk.BooleanVar()
+        self.api_fan_enabled_var = tk.BooleanVar()
+        self.api_power_enabled_var = tk.BooleanVar()
+        
+        ttk.Checkbutton(api_enable_frame, text="Temperature", variable=self.api_temp_enabled_var).grid(row=0, column=0, sticky=tk.W, padx=5)
+        ttk.Checkbutton(api_enable_frame, text="Terahash", variable=self.api_th_enabled_var).grid(row=0, column=1, sticky=tk.W, padx=5)
+        ttk.Checkbutton(api_enable_frame, text="Frequency", variable=self.api_freq_enabled_var).grid(row=0, column=2, sticky=tk.W, padx=5)
+        ttk.Checkbutton(api_enable_frame, text="Fan Speed", variable=self.api_fan_enabled_var).grid(row=1, column=0, sticky=tk.W, padx=5)
+        ttk.Checkbutton(api_enable_frame, text="Power", variable=self.api_power_enabled_var).grid(row=1, column=1, sticky=tk.W, padx=5)
+        
         # Custom API Endpoints (all optional)
-        ttk.Label(api_frame, text="Leave endpoints blank to disable specific metrics").grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=(5, 10))
+        ttk.Label(api_frame, text="API Endpoint Configuration (leave blank to use defaults)").grid(row=4, column=0, columnspan=2, sticky=tk.W, pady=(5, 10))
         
         # Temperature
-        ttk.Label(api_frame, text="Temperature:").grid(row=3, column=0, sticky=tk.W, padx=(0, 10), pady=(5, 0))
+        ttk.Label(api_frame, text="Temperature:").grid(row=5, column=0, sticky=tk.W, padx=(0, 10), pady=(5, 0))
         temp_container = ttk.Frame(api_frame)
-        temp_container.grid(row=3, column=1, sticky=(tk.W, tk.E), padx=(0, 10), pady=(5, 0))
+        temp_container.grid(row=5, column=1, sticky=(tk.W, tk.E), padx=(0, 10), pady=(5, 0))
         self.temp_endpoint_var = tk.StringVar()
         ttk.Label(temp_container, text="Command:").pack(side=tk.LEFT)
         ttk.Entry(temp_container, textvariable=self.temp_endpoint_var, width=25).pack(side=tk.LEFT, padx=(5, 10))
@@ -711,9 +836,9 @@ class SettingsWindow:
         ttk.Entry(temp_container, textvariable=self.temp_path_var, width=20).pack(side=tk.LEFT, padx=(5, 0))
         
         # Terahash
-        ttk.Label(api_frame, text="Terahash:").grid(row=4, column=0, sticky=tk.W, padx=(0, 10), pady=(5, 0))
+        ttk.Label(api_frame, text="Terahash:").grid(row=6, column=0, sticky=tk.W, padx=(0, 10), pady=(5, 0))
         th_container = ttk.Frame(api_frame)
-        th_container.grid(row=4, column=1, sticky=(tk.W, tk.E), padx=(0, 10), pady=(5, 0))
+        th_container.grid(row=6, column=1, sticky=(tk.W, tk.E), padx=(0, 10), pady=(5, 0))
         self.th_endpoint_var = tk.StringVar()
         ttk.Label(th_container, text="Command:").pack(side=tk.LEFT)
         ttk.Entry(th_container, textvariable=self.th_endpoint_var, width=25).pack(side=tk.LEFT, padx=(5, 10))
@@ -722,9 +847,9 @@ class SettingsWindow:
         ttk.Entry(th_container, textvariable=self.th_path_var, width=20).pack(side=tk.LEFT, padx=(5, 0))
         
         # Frequency
-        ttk.Label(api_frame, text="Frequency:").grid(row=5, column=0, sticky=tk.W, padx=(0, 10), pady=(5, 0))
+        ttk.Label(api_frame, text="Frequency:").grid(row=7, column=0, sticky=tk.W, padx=(0, 10), pady=(5, 0))
         freq_container = ttk.Frame(api_frame)
-        freq_container.grid(row=5, column=1, sticky=(tk.W, tk.E), padx=(0, 10), pady=(5, 0))
+        freq_container.grid(row=7, column=1, sticky=(tk.W, tk.E), padx=(0, 10), pady=(5, 0))
         self.freq_endpoint_var = tk.StringVar()
         ttk.Label(freq_container, text="Command:").pack(side=tk.LEFT)
         ttk.Entry(freq_container, textvariable=self.freq_endpoint_var, width=25).pack(side=tk.LEFT, padx=(5, 10))
@@ -733,9 +858,9 @@ class SettingsWindow:
         ttk.Entry(freq_container, textvariable=self.freq_path_var, width=20).pack(side=tk.LEFT, padx=(5, 0))
         
         # Fan Speed
-        ttk.Label(api_frame, text="Fan Speed:").grid(row=6, column=0, sticky=tk.W, padx=(0, 10), pady=(5, 0))
+        ttk.Label(api_frame, text="Fan Speed:").grid(row=8, column=0, sticky=tk.W, padx=(0, 10), pady=(5, 0))
         fan_container = ttk.Frame(api_frame)
-        fan_container.grid(row=6, column=1, sticky=(tk.W, tk.E), padx=(0, 10), pady=(5, 0))
+        fan_container.grid(row=8, column=1, sticky=(tk.W, tk.E), padx=(0, 10), pady=(5, 0))
         self.fan_endpoint_var = tk.StringVar()
         ttk.Label(fan_container, text="Command:").pack(side=tk.LEFT)
         ttk.Entry(fan_container, textvariable=self.fan_endpoint_var, width=25).pack(side=tk.LEFT, padx=(5, 10))
@@ -744,9 +869,9 @@ class SettingsWindow:
         ttk.Entry(fan_container, textvariable=self.fan_path_var, width=20).pack(side=tk.LEFT, padx=(5, 0))
         
         # Power
-        ttk.Label(api_frame, text="Power:").grid(row=7, column=0, sticky=tk.W, padx=(0, 10), pady=(5, 0))
+        ttk.Label(api_frame, text="Power:").grid(row=9, column=0, sticky=tk.W, padx=(0, 10), pady=(5, 0))
         power_container = ttk.Frame(api_frame)
-        power_container.grid(row=7, column=1, sticky=(tk.W, tk.E), padx=(0, 10), pady=(5, 0))
+        power_container.grid(row=9, column=1, sticky=(tk.W, tk.E), padx=(0, 10), pady=(5, 0))
         self.power_endpoint_var = tk.StringVar()
         ttk.Label(power_container, text="Command:").pack(side=tk.LEFT)
         ttk.Entry(power_container, textvariable=self.power_endpoint_var, width=25).pack(side=tk.LEFT, padx=(5, 10))
@@ -785,7 +910,6 @@ class SettingsWindow:
         self.ssh_username_var.set(self.config.get("ssh_username", ""))
         self.ssh_password_var.set(self.config.get("ssh_password", ""))
         self.ssh_command_var.set(self.config.get("ssh_command", "python3 voltage.py"))
-        self.ssh_timeout_var.set(str(self.config.get("ssh_timeout", 10)))
         self.close_to_tray_var.set(self.config.get("close_to_tray", True))
         
         # Load API settings
@@ -802,6 +926,14 @@ class SettingsWindow:
         self.fan_path_var.set(self.config.get("fan_path", "FANS"))
         self.power_endpoint_var.set(self.config.get("power_endpoint", '{"command":"power"}'))
         self.power_path_var.set(self.config.get("power_path", "POWER.0.Watts"))
+        
+        # Load API call enabled settings
+        api_calls = self.config.get("api_calls_enabled", {})
+        self.api_temp_enabled_var.set(api_calls.get("temperature", True))
+        self.api_th_enabled_var.set(api_calls.get("terahash", True))
+        self.api_freq_enabled_var.set(api_calls.get("frequency", False))
+        self.api_fan_enabled_var.set(api_calls.get("fan_speed", True))
+        self.api_power_enabled_var.set(api_calls.get("power", True))
     
     def save_settings(self):
         """Save settings and update main window"""
@@ -811,7 +943,6 @@ class SettingsWindow:
             seconds = int(self.interval_seconds_var.get())
             retry_count = int(self.retry_count_var.get())
             retry_delay = int(self.retry_delay_var.get())
-            ssh_timeout = int(self.ssh_timeout_var.get())
             
             if minutes < 0 or seconds < 0:
                 messagebox.showerror("Error", "Ping interval values must be non-negative")
@@ -819,10 +950,6 @@ class SettingsWindow:
             
             if retry_count < 0 or retry_delay < 0:
                 messagebox.showerror("Error", "Retry values must be non-negative")
-                return
-            
-            if ssh_timeout < 1:
-                messagebox.showerror("Error", "SSH timeout must be at least 1 second")
                 return
             
             # Validate SSH settings only if SSH is enabled
@@ -843,11 +970,11 @@ class SettingsWindow:
                 "retry_count": retry_count,
                 "retry_delay": retry_delay,
                 "ssh_enabled": ssh_enabled,
-                "ssh_host": self.ip_var.get(),  # Use same host as ping
+                "ssh_host": self.ip_var.get(),  # Use same IP as ping
                 "ssh_username": self.ssh_username_var.get(),
                 "ssh_password": self.ssh_password_var.get(),
                 "ssh_command": self.ssh_command_var.get(),
-                "ssh_timeout": ssh_timeout,
+                "ssh_timeout": self.config.get("ssh_timeout", 10),
                 "close_to_tray": self.close_to_tray_var.get(),
                 # API settings
                 "miner_ip": self.miner_ip_var.get(),
@@ -862,7 +989,15 @@ class SettingsWindow:
             "fan_endpoint": self.fan_endpoint_var.get(),
             "fan_path": self.fan_path_var.get(),
             "power_endpoint": self.power_endpoint_var.get(),
-            "power_path": self.power_path_var.get()
+            "power_path": self.power_path_var.get(),
+            # API call enabled settings
+            "api_calls_enabled": {
+                "temperature": self.api_temp_enabled_var.get(),
+                "terahash": self.api_th_enabled_var.get(),
+                "frequency": self.api_freq_enabled_var.get(),
+                "fan_speed": self.api_fan_enabled_var.get(),
+                "power": self.api_power_enabled_var.get()
+            }
             })
             
             # Call save callback
@@ -910,10 +1045,18 @@ class HeartbeatMonitor:
             "fan_path": "FANS",
             "power_endpoint": '{"command":"power"}',
             "power_path": "POWER.0.Watts",
-            # Metric toggles
-            "metrics_enabled": {
+            # Metric display toggles (for graph)
+            "metrics_display": {
                 "ping": True,
                 "ssh_voltage": True,
+                "temperature": True,
+                "terahash": True,
+                "frequency": False,
+                "fan_speed": True,
+                "power": True
+            },
+            # API call toggles (for data collection)
+            "api_calls_enabled": {
                 "temperature": True,
                 "terahash": True,
                 "frequency": False,
@@ -922,6 +1065,9 @@ class HeartbeatMonitor:
             }
         }
         self.config = self.load_config()
+        # SSH worker state
+
+
         
         # Initialize metrics manager
         self.metrics_manager = MetricsManager()
@@ -964,28 +1110,40 @@ class HeartbeatMonitor:
         # This ensures historical data shows in the graph on startup
         # Check both legacy history and metrics system for data
         has_data = bool(self.ping_history)
-        for metric in self.metrics_manager.get_enabled_metrics():
+        for metric in self.metrics_manager.metrics.values():
             if metric.data_history:
                 has_data = True
                 break
         
-        if has_data:  # Only schedule if there's historical data
-            self.root.after(100, lambda: self.optimized_update_graph(force_update=True))
+        # Initial graph load - identical to working manual refresh pattern
+        self.root.after(500, self._initial_graph_load)
         
         # Bind resize event to update graph
         self.root.bind('<Configure>', self.on_window_resize)
         
         # Setup system tray
         self.setup_tray()
+
+
+    
+    def _initial_graph_load(self):
+        """Initial graph load using identical pattern to working manual refresh"""
+        # Force immediate graph update - identical to working refresh pattern
+        self.last_graph_update = 0
+        self.root.after(10, lambda: self.optimized_update_graph(force_update=True))
         
         # Bind window closing event
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
     
     def _update_metrics_from_config(self):
         """Update metrics enabled state from config"""
-        metrics_config = self.config.get("metrics_enabled", {})
+        # Ping and SSH voltage are always enabled for data collection
+        # API metrics enabled state based on api_calls_enabled config
         for metric_name, metric in self.metrics_manager.metrics.items():
-            metric.enabled = metrics_config.get(metric_name, metric_name in ["ping", "ssh_voltage"])
+            if metric_name in ['ping', 'ssh_voltage']:
+                metric.enabled = True  # Always collect ping and SSH data
+            else:
+                metric.enabled = True  # API metrics always collect data
     
     def load_config(self):
         """Load configuration from file or use defaults"""
@@ -993,7 +1151,17 @@ class HeartbeatMonitor:
             try:
                 with open(self.config_file, 'r') as f:
                     loaded_config = json.load(f)
-                            # Legacy migration code removed - all users should have migrated by now
+                    
+                    # Migrate old metrics_enabled to new format
+                    if 'metrics_enabled' in loaded_config:
+                        if 'metrics_display' not in loaded_config:
+                            loaded_config['metrics_display'] = loaded_config.get('metrics_enabled', {})
+                        if 'api_calls_enabled' not in loaded_config:
+                            loaded_config['api_calls_enabled'] = {
+                                k: v for k, v in loaded_config.get('metrics_enabled', {}).items()
+                                if k not in ['ping', 'ssh_voltage']
+                            }
+                    
                     return loaded_config
             except:
                 return self.default_config.copy()
@@ -1146,7 +1314,9 @@ class HeartbeatMonitor:
         # Create toggle variables and checkboxes for each metric
         self.metric_toggles = {}
         for i, (metric_name, metric) in enumerate(self.metrics_manager.metrics.items()):
-            var = tk.BooleanVar(value=metric.enabled)
+            # Use display setting for toggle state
+            display_enabled = self.config.get("metrics_display", {}).get(metric_name, True)
+            var = tk.BooleanVar(value=display_enabled)
             self.metric_toggles[metric_name] = var
             
             checkbox = ttk.Checkbutton(
@@ -1336,6 +1506,7 @@ class HeartbeatMonitor:
             
             with open(filename, 'w', encoding='utf-8') as f:
                 f.write(self.events_text.get(1.0, tk.END))
+                f.flush()  # Force immediate write to disk
             
             # Auto-save happens silently - no log message
             
@@ -1430,20 +1601,7 @@ class HeartbeatMonitor:
             return
         
         try:
-            # Show loading indicator for time range changes
-            if self.current_time_range != getattr(self, '_last_displayed_range', None):
-                # Update status to show loading
-                self.status_var.set(f"Loading {self.current_time_range}...")
-                self.root.update()
-                
-                self.ax.clear()
-                self.ax.set_title(f'Loading {self.current_time_range}...')
-                self.ax.set_xlabel('Time')
-                self.ax.set_ylabel('Status / Voltage (V)')
-                self.ax.grid(True, alpha=0.3)
-                self.fig.tight_layout()
-                self.canvas.draw()
-                self.root.update()  # Force immediate update
+            # Skip loading indicator - just update directly
             
             # Simple cleanup - just clear the plot
             self.ax.clear()
@@ -1472,7 +1630,9 @@ class HeartbeatMonitor:
                     continue
                     
                 metric = self.metrics_manager.get_metric(metric_name)
-                if not metric or not metric.enabled or metric_name in plotted_metrics:
+                # Check display setting instead of metric.enabled for graph plotting
+                display_enabled = self.config.get("metrics_display", {}).get(metric_name, True)
+                if not metric or not display_enabled or metric_name in plotted_metrics:
                     continue
                 
                 plotted_metrics.add(metric_name)
@@ -1525,7 +1685,7 @@ class HeartbeatMonitor:
                             linestyle='-',
                             linewidth=2, 
                             markersize=6, 
-                            label=f"{metric.display_name} ({metric.format_value(sorted_values[-1]) if sorted_values else 'N/A'})", 
+                            label=f"{metric.display_name}", 
                             picker=5
                         )[0]
                         
@@ -1543,7 +1703,7 @@ class HeartbeatMonitor:
             title = f'Live Monitoring - {self.current_time_range} ({total_points} points)'
             self.ax.set_title(title)
             self.ax.grid(True, alpha=0.3)
-            self.ax.legend()
+            self.ax.legend(loc='lower left')
             
             # Simple x-axis formatting using first available metric data
             first_times = next((data['times'] for data in filtered_data.values() if data['times']), [])
@@ -1555,20 +1715,22 @@ class HeartbeatMonitor:
             # Adjust layout and draw
             self.fig.tight_layout()
             self.canvas.draw()
-            
+        
             # Update timestamp and displayed range
             self.last_graph_update = current_time
             self._last_displayed_range = self.current_time_range
+            self.graph_update_pending = False
             
-            # Restore status if we were loading
-            if self.status_var.get().startswith("Loading"):
-                if self.is_monitoring:
-                    self.status_var.set("Monitoring...")
-                else:
-                    self.status_var.set("Ready")
-            
+            # Update status
+            if self.is_monitoring:
+                self.status_var.set("Monitoring...")
+            else:
+                self.status_var.set("Ready")
+                    
         except Exception as e:
-            # If graph update fails, show error message
+            # Handle any graph errors
+            print(f"Graph update error: {e}")
+            self.status_var.set("Graph error")
             self.ax.clear()
             self.ax.set_title(f'Graph Error - {self.current_time_range}')
             self.ax.set_xlabel('Time')
@@ -1604,9 +1766,8 @@ class HeartbeatMonitor:
         filtered_data = {}
         
         for metric_name, metric in self.metrics_manager.metrics.items():
-            if not metric.enabled:
-                filtered_data[metric_name] = {'times': [], 'values': []}
-                continue
+            # Simply get all available data - no filtering here
+            filtered_data[metric_name] = {'times': [], 'values': []}
             
             with self.metrics_manager.data_lock:
                 filtered_times = []
@@ -1693,19 +1854,18 @@ class HeartbeatMonitor:
         max_time = max(times)
         time_span = max_time - min_time
         
-        # Simple formatting based on time span with reasonable tick limits
+        # Simple formatting with limited ticks to prevent overload
         self.ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
         
-        if time_span.total_seconds() <= 1800:  # 30 minutes or less
-            self.ax.xaxis.set_major_locator(mdates.MinuteLocator(interval=5))
-        elif time_span.total_seconds() <= 3600:  # 1 hour or less
+        # Always use reasonable intervals regardless of time span
+        if time_span.total_seconds() <= 3600:  # 1 hour or less
             self.ax.xaxis.set_major_locator(mdates.MinuteLocator(interval=10))
-        elif time_span.total_seconds() <= 14400:  # 4 hours or less
-            self.ax.xaxis.set_major_locator(mdates.MinuteLocator(interval=30))
-        elif time_span.total_seconds() <= 43200:  # 12 hours or less
-            self.ax.xaxis.set_major_locator(mdates.HourLocator(interval=1))
-        else:
+        elif time_span.total_seconds() <= 86400:  # 1 day or less
             self.ax.xaxis.set_major_locator(mdates.HourLocator(interval=2))
+        else:
+            # For longer spans, use day intervals to prevent tick explosion
+            self.ax.xaxis.set_major_locator(mdates.DayLocator(interval=1))
+            self.ax.xaxis.set_major_formatter(mdates.DateFormatter('%m/%d'))
         
         plt.setp(self.ax.xaxis.get_majorticklabels(), rotation=45)
     
@@ -1722,17 +1882,19 @@ class HeartbeatMonitor:
         # Force immediate graph update using after() to prevent UI freezing
         self.last_graph_update = 0
         self.root.after(10, lambda: self.optimized_update_graph(force_update=True))
+        
+        # Update window statistics immediately when time range changes
+        self.root.after(20, self.update_window_statistics)
     
     def on_metric_toggle(self, metric_name):
-        """Handle metric toggle change"""
-        # Update metric enabled state
+        """Handle metric toggle change (for display only)"""
+        # Update display setting only
         enabled = self.metric_toggles[metric_name].get()
-        self.metrics_manager.get_metric(metric_name).enabled = enabled
         
-        # Update config
-        if "metrics_enabled" not in self.config:
-            self.config["metrics_enabled"] = {}
-        self.config["metrics_enabled"][metric_name] = enabled
+        # Update config display settings
+        if "metrics_display" not in self.config:
+            self.config["metrics_display"] = {}
+        self.config["metrics_display"][metric_name] = enabled
         
         # Save config
         self.save_config()
@@ -1841,6 +2003,7 @@ class HeartbeatMonitor:
             self.total_downtime_seconds = 0
             self.last_status_update = datetime.now()
             self.last_status = None
+
             self.monitor_thread = threading.Thread(target=self.monitor_loop, daemon=True)
             self.monitor_thread.start()
             
@@ -1868,10 +2031,13 @@ class HeartbeatMonitor:
                 # Use metrics manager to collect all data
                 results = self.metrics_manager.collect_all_data(self.config)
                 
+
+                
                 # Handle ping metric specifically for legacy compatibility
                 ping_result = results.get('ping')
-                if ping_result and ping_result['success']:
-                    is_up = ping_result['value'] == 'UP'
+                is_up = False
+                if ping_result and ping_result.get('success'):
+                    is_up = (ping_result.get('value') == 'UP')
                 self.total_pings += 1
                 if is_up:
                     self.successful_pings += 1
@@ -1901,7 +2067,7 @@ class HeartbeatMonitor:
                 with self.data_lock:
                     self.ping_history.append({
                         'timestamp': current_time,
-                            'status': ping_result['value']
+                        'status': (ping_result.get('value') if ping_result else 'DOWN')
                     })
                 
                     # Update UI
@@ -1915,7 +2081,7 @@ class HeartbeatMonitor:
                     else:
                         self.root.after(0, lambda: self.log_event(f"UP: {current_time.strftime('%Y-%m-%d %H:%M:%S')}", "up"))
                 
-                # Handle SSH voltage metric specifically
+                # Handle SSH voltage metric
                 ssh_result = results.get('ssh_voltage')
                 if ssh_result and ssh_result['success']:
                     voltage = ssh_result['value']
@@ -1931,19 +2097,23 @@ class HeartbeatMonitor:
                         })
                     
                     # Update UI
-                    self.root.after(0, lambda v=voltage: self.last_ssh_var.set(
-                        f"Last SSH: {current_time.strftime('%Y-%m-%d %H:%M:%S')} - {v:.2f}V"
+                    self.root.after(0, lambda v=voltage: self.last_voltage_var.set(
+                        f"Voltage: {v:.2f}V"
                     ))
-                    self.root.after(0, lambda v=voltage: self.log_event(f"SSH: {v:.2f}V", "ssh"))
+                    self.root.after(0, lambda v=voltage: self.log_event(f"Voltage: {v:.2f}V", "voltage"))
                 elif self.config.get("ssh_enabled", False):
                     # SSH failed
                     self.total_ssh += 1
-                    self.root.after(0, lambda: self.last_ssh_var.set(
-                        f"Last SSH: {current_time.strftime('%Y-%m-%d %H:%M:%S')} - FAILED"
-                    ))
-                    self.root.after(0, lambda: self.log_event(f"SSH: FAILED", "ssh_fail"))
+                    self.root.after(0, lambda: self.last_voltage_var.set("Voltage: FAILED"))
+                    ssh_err = None
+                    try:
+                        ssh_err = results.get('ssh_voltage', {}).get('metric').last_error
+                    except Exception:
+                        pass
+                    fail_msg = f"Voltage: FAILED" + (f" - {ssh_err}" if ssh_err else "")
+                    self.root.after(0, lambda m=fail_msg: self.log_event(m, "voltage_fail"))
                 
-                # Log other metrics
+                # Log all metrics that were actually called (regardless of settings)
                 for metric_name, result in results.items():
                     if metric_name in ['ping', 'ssh_voltage']:
                         continue  # Already handled above
@@ -1951,14 +2121,15 @@ class HeartbeatMonitor:
                     metric = result['metric']
                     if result['success']:
                         formatted_value = metric.format_value(result['value'])
-                        self.root.after(0, lambda name=metric.display_name, val=formatted_value: 
-                                      self.log_event(f"{name}: {val}", "metric"))
+                        self.log_event(f"{metric.display_name}: {formatted_value}", "metric")
                     else:
-                        self.root.after(0, lambda name=metric.display_name: 
-                                      self.log_event(f"{name}: FAILED", "metric_fail"))
+                        self.log_event(f"{metric.display_name}: FAILED", "metric_fail")
                 
-                # Auto-save on every new data point
-                self.root.after(0, self.auto_save_events)
+                # Auto-save immediately after logging
+                self.auto_save_events()
+                
+                # Schedule graph update (throttled internally)
+                self.root.after(0, lambda: self.optimized_update_graph())
                 
                 # Calculate total interval in seconds
                 total_interval = self.config["ping_interval_minutes"] * 60 + self.config["ping_interval_seconds"]
@@ -2054,18 +2225,18 @@ class HeartbeatMonitor:
             end_pos = self.events_text.index(tk.END)
             self.events_text.tag_add("up_event", start_pos, end_pos)
             self.events_text.tag_config("up_event", foreground="green")
-        elif event_type == "ssh":
-            # Color SSH voltage events in blue
+        elif event_type == "voltage":
+            # Color voltage events in blue
             start_pos = f"{self.events_text.index(tk.END).split('.')[0]}.0"
             end_pos = self.events_text.index(tk.END)
-            self.events_text.tag_add("ssh_event", start_pos, end_pos)
-            self.events_text.tag_config("ssh_event", foreground="blue", font=("Arial", 9, "bold"))
-        elif event_type == "ssh_fail":
-            # Color SSH failure events in orange
+            self.events_text.tag_add("voltage_event", start_pos, end_pos)
+            self.events_text.tag_config("voltage_event", foreground="blue", font=("Arial", 9, "bold"))
+        elif event_type == "voltage_fail":
+            # Color voltage failure events in orange
             start_pos = f"{self.events_text.index(tk.END).split('.')[0]}.0"
             end_pos = self.events_text.index(tk.END)
-            self.events_text.tag_add("ssh_fail_event", start_pos, end_pos)
-            self.events_text.tag_config("ssh_fail_event", foreground="orange", font=("Arial", 9, "bold"))
+            self.events_text.tag_add("voltage_fail_event", start_pos, end_pos)
+            self.events_text.tag_config("voltage_fail_event", foreground="orange", font=("Arial", 9, "bold"))
         elif event_type == "auto_save":
             # Color auto-save events in purple
             start_pos = f"{self.events_text.index(tk.END).split('.')[0]}.0"
@@ -2112,6 +2283,10 @@ class HeartbeatMonitor:
     def parse_existing_events(self, content):
         """Parse existing event log to reconstruct monitoring history"""
         lines = content.strip().split('\n')
+        
+        # Limit to last 1000 lines to prevent graph overload
+        if len(lines) > 1000:
+            lines = lines[-1000:]
         ping_count = 0
         ssh_count = 0
         successful_pings = 0
@@ -2126,6 +2301,8 @@ class HeartbeatMonitor:
         freq_metric = self.metrics_manager.get_metric('frequency')
         fan_metric = self.metrics_manager.get_metric('fan_speed')
         power_metric = self.metrics_manager.get_metric('power')
+        
+
         
         for line in lines:
             if not line.strip():
@@ -2178,11 +2355,10 @@ class HeartbeatMonitor:
                         })
                         # Add to metrics system
                         if ping_metric:
-                            with self.metrics_manager.data_lock:
-                                ping_metric.data_history.append({
-                                    'timestamp': timestamp,
-                                    'value': 'UP'
-                        })
+                            ping_metric.data_history.append({
+                                'timestamp': timestamp,
+                                'value': 'UP'
+                            })
                         
                     elif 'DOWN:' in line:
                         ping_count += 1
@@ -2193,18 +2369,20 @@ class HeartbeatMonitor:
                         self.last_down_time = timestamp
                         # Add to metrics system
                         if ping_metric:
-                            with self.metrics_manager.data_lock:
-                                ping_metric.data_history.append({
-                                    'timestamp': timestamp,
-                                    'value': 'DOWN'
-                                })
+                            ping_metric.data_history.append({
+                                'timestamp': timestamp,
+                                'value': 'DOWN'
+                            })
                         
-                    elif 'SSH:' in line and 'V' in line:
+                    elif ('SSH:' in line or 'Voltage:' in line) and 'V' in line:
                         ssh_count += 1
                         successful_ssh += 1
                         # Extract voltage value
                         try:
-                            voltage_str = line.split('SSH:')[1].split('V')[0].strip()
+                            if 'SSH:' in line:
+                                voltage_str = line.split('SSH:')[1].split('V')[0].strip()
+                            else:
+                                voltage_str = line.split('Voltage:')[1].split('V')[0].strip()
                             voltage = float(voltage_str)
                             self.ssh_history.append({
                                 'timestamp': timestamp,
@@ -2213,11 +2391,10 @@ class HeartbeatMonitor:
                             })
                             # Add to metrics system
                             if ssh_metric:
-                                with self.metrics_manager.data_lock:
-                                    ssh_metric.data_history.append({
-                                        'timestamp': timestamp,
-                                        'value': voltage
-                                    })
+                                ssh_metric.data_history.append({
+                                    'timestamp': timestamp,
+                                    'value': voltage
+                                })
                         except:
                             pass
                     
@@ -2228,11 +2405,10 @@ class HeartbeatMonitor:
                             temp_str = line.split(':')[-1].replace('°C', '').strip()
                             temp_value = float(temp_str)
                             if temp_metric:
-                                with self.metrics_manager.data_lock:
-                                    temp_metric.data_history.append({
-                                        'timestamp': timestamp,
-                                        'value': temp_value
-                                    })
+                                temp_metric.data_history.append({
+                                    'timestamp': timestamp,
+                                    'value': temp_value
+                                })
                         except:
                             pass
                     
@@ -2243,11 +2419,10 @@ class HeartbeatMonitor:
                                 th_str = line.split('TH/s:')[1].replace('TH/s', '').strip()
                                 th_value = float(th_str)
                                 if th_metric:
-                                    with self.metrics_manager.data_lock:
-                                        th_metric.data_history.append({
-                                            'timestamp': timestamp,
-                                            'value': th_value
-                                        })
+                                    th_metric.data_history.append({
+                                        'timestamp': timestamp,
+                                        'value': th_value
+                                    })
                         except:
                             pass
                     
@@ -2258,11 +2433,10 @@ class HeartbeatMonitor:
                                 freq_str = line.split(':')[-1].replace('MHz', '').strip()
                                 freq_value = float(freq_str)
                                 if freq_metric:
-                                    with self.metrics_manager.data_lock:
-                                        freq_metric.data_history.append({
-                                            'timestamp': timestamp,
-                                            'value': freq_value
-                                        })
+                                    freq_metric.data_history.append({
+                                        'timestamp': timestamp,
+                                        'value': freq_value
+                                    })
                         except:
                             pass
                     
@@ -2273,10 +2447,9 @@ class HeartbeatMonitor:
                                 fan_str = line.split(':')[-1].replace('%', '').strip()
                                 fan_value = float(fan_str)
                                 if fan_metric:
-                                    with self.metrics_manager.data_lock:
-                                        fan_metric.data_history.append({
-                                            'timestamp': timestamp,
-                                            'value': fan_value
+                                    fan_metric.data_history.append({
+                                        'timestamp': timestamp,
+                                        'value': fan_value
                                     })
                         except:
                             pass
@@ -2288,15 +2461,14 @@ class HeartbeatMonitor:
                                 power_str = line.split(':')[-1].replace('W', '').strip()
                                 power_value = float(power_str)
                                 if power_metric:
-                                    with self.metrics_manager.data_lock:
-                                        power_metric.data_history.append({
-                                            'timestamp': timestamp,
-                                            'value': power_value
-                                        })
+                                    power_metric.data_history.append({
+                                        'timestamp': timestamp,
+                                        'value': power_value
+                                    })
                         except:
                             pass
                             
-                    elif 'SSH: FAILED' in line:
+                    elif 'SSH: FAILED' in line or 'Voltage: FAILED' in line:
                         ssh_count += 1
                         self.ssh_history.append({
                             'timestamp': timestamp,
@@ -2306,6 +2478,8 @@ class HeartbeatMonitor:
                             
             except Exception as e:
                 continue
+        
+
         
         # Update statistics
         self.total_pings = ping_count
@@ -2358,7 +2532,8 @@ class HeartbeatMonitor:
 
     def on_window_resize(self, event):
         """Handle window resize to update graph canvas"""
-        if self.is_monitoring:
+        # Only update on main window resize, not child widgets
+        if event.widget == self.root and self.is_monitoring:
             self.optimized_update_graph()
     
     def create_tray_icon(self):
@@ -2435,11 +2610,12 @@ class HeartbeatMonitor:
         except Exception as e:
             print(f"Cleanup error: {e}")
             
-        remove_lock_file()
         if self.config.get("close_to_tray", True):
-            # Hide to tray instead of closing
+            # Hide to tray instead of closing - keep lock file
             self.root.withdraw()
         else:
+            # Actually quitting - remove lock file
+            remove_lock_file()
             # Ask user if they want to quit
             if messagebox.askokcancel("Quit", "Do you want to quit the application?"):
                 self.quit_app()
