@@ -223,7 +223,7 @@ class SSHVoltageMetric(BaseMetric):
     """SSH voltage metric (existing functionality)"""
     
     def __init__(self):
-        super().__init__("ssh_voltage", "Voltage (V)", "green", "s", True)
+        super().__init__("ssh_voltage", "Voltage (V)", "lime", "s", True)
     
     def collect_data(self):
         """Collect SSH voltage data using existing SSH logic"""
@@ -424,7 +424,9 @@ class TemperatureMetric(APIMetric):
     """Temperature metric via API - uses temps command to get board temperature"""
     
     def __init__(self):
-        super().__init__("temperature", "Temperature (°C)", "red", "^", '{"command":"temps"}', "TEMPS.0.TopLeft")
+        super().__init__("temperature", "Temp", "red", "^", '{"command":"temps"}', "TEMPS.0.TopLeft")
+    
+
     
     def validate_value(self, value):
         if isinstance(value, (int, float)) and -40 <= value <= 150:
@@ -491,7 +493,7 @@ class FrequencyMetric(APIMetric):
     """Frequency metric via API - uses average frequency from stats"""
     
     def __init__(self):
-        super().__init__("frequency", "Freq (MHz)", "purple", "d", '{"command":"stats"}', "STATS.1.frequency")
+        super().__init__("frequency", "Freq (MHz)", "magenta", "d", '{"command":"stats"}', "STATS.1.frequency")
     
     def validate_value(self, value):
         if isinstance(value, (int, float)) and value > 0:
@@ -563,7 +565,7 @@ class PowerMetric(APIMetric):
     """Power consumption metric via API"""
     
     def __init__(self):
-        super().__init__("power", "Power (W)", "red", "H", '{"command":"power"}', "POWER.0.Watts")
+        super().__init__("power", "Power (W)", "darkviolet", "H", '{"command":"power"}', "POWER.0.Watts")
     
     def validate_value(self, value):
         if isinstance(value, (int, float)) and value >= 0:
