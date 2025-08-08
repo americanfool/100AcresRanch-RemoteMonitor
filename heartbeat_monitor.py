@@ -1404,8 +1404,8 @@ class HeartbeatMonitor:
             # Update last metric readings
             self.update_last_readings()
             
-            # Update graph with throttling
-            self.optimized_update_graph()
+            # Skip graph rendering here to avoid double updates while monitoring.
+            # Graph updates are triggered after each collection tick from the monitor loop.
         
         # Schedule next update
         self.root.after(1000, self.update_ui_timer)
@@ -1504,16 +1504,19 @@ class HeartbeatMonitor:
     def auto_save_events(self):
         """Auto-save events to file immediately"""
         try:
-            filename = "events_log.txt"
-            
-            with open(filename, 'w', encoding='utf-8') as f:
-                f.write(self.events_text.get(1.0, tk.END))
-                f.flush()  # Force immediate write to disk
-            
-            # Auto-save happens silently - no log message
-            
+            # Read widget text on UI thread quickly, then write on a background thread
+            content = self.events_text.get(1.0, tk.END)
+            def _write_file(data: str):
+                try:
+                    with open("events_log.txt", 'w', encoding='utf-8') as f:
+                        f.write(data)
+                        f.flush()
+                except Exception as ex:
+                    # Defer error logging to UI thread
+                    self.root.after(0, lambda: self.log_event(f"Auto-save failed: {ex}", "error"))
+            threading.Thread(target=_write_file, args=(content,), daemon=True).start()
         except Exception as e:
-            self.log_event(f"Auto-save failed: {e}", "error")
+            self.root.after(0, lambda: self.log_event(f"Auto-save failed: {e}", "error"))
     
     def update_time_since_down(self):
         """Update the time since last down display"""
@@ -1576,33 +1579,35 @@ class HeartbeatMonitor:
     def optimized_update_graph(self, force_update=False):
         """Update the live monitoring graph with simple throttling"""
         import time
-        
+
         current_time = time.time()
-        
-        # Simple throttling - only update every 5 seconds (unless forced)
+
+        # Throttle and guard before acquiring render lock
         if not force_update and current_time - self.last_graph_update < self.graph_update_interval:
             return
-            
         if len(self.ping_history) < 2 and not any(m.data_history for m in self.metrics_manager.metrics.values()):
             return
-        
-        # Prevent too frequent updates during time range changes (unless forced)
         if not force_update and hasattr(self, '_last_time_range_change') and current_time - self._last_time_range_change < 0.5:
             return
-        
-        # Safety check - don't update if too much data (prevents freezing)
-        if len(self.ping_history) > 10000:
-            self.ax.clear()
-            self.ax.set_title(f'Live Monitoring - {self.current_time_range} (Too much data)')
-            self.ax.set_xlabel('Time')
-            self.ax.set_ylabel('Status / Voltage (V)')
-            self.ax.grid(True, alpha=0.3)
-            self.fig.tight_layout()
-            self.canvas.draw()
-            self.last_graph_update = current_time
+
+        # Prevent re-entrant or overlapping renders which can freeze UI
+        if getattr(self, "_graph_rendering", False):
             return
-        
+        self._graph_rendering = True
+
         try:
+            # Safety check - don't update if too much data (prevents freezing)
+            if len(self.ping_history) > 10000:
+                self.ax.clear()
+                self.ax.set_title(f'Live Monitoring - {self.current_time_range} (Too much data)')
+                self.ax.set_xlabel('Time')
+                self.ax.set_ylabel('Status / Voltage (V)')
+                self.ax.grid(True, alpha=0.3)
+                self.fig.tight_layout()
+                self.canvas.draw()
+                self.last_graph_update = current_time
+                return
+
             # Skip loading indicator - just update directly
             
             # Simple cleanup - just clear the plot
@@ -1649,12 +1654,12 @@ class HeartbeatMonitor:
                     down_times = []
                     down_statuses = []
                     
-                    for time, status in zip(data['times'], data['values']):
+                    for tval, status in zip(data['times'], data['values']):
                         if status == 'UP':
-                            up_times.append(time)
+                            up_times.append(tval)
                             up_statuses.append(90)  # Show at 90% on normalized scale
                         else:
-                            down_times.append(time)
+                            down_times.append(tval)
                             down_statuses.append(10)  # Show at 10% on normalized scale
                     
                     if up_times:
@@ -1711,8 +1716,9 @@ class HeartbeatMonitor:
             first_times = next((data['times'] for data in filtered_data.values() if data['times']), [])
             self.setup_x_axis_format(first_times)
             
-            # Enable tooltips
-            self.canvas.mpl_connect('pick_event', self.on_pick)
+            # Enable tooltips (connect once)
+            if not hasattr(self, '_pick_cid') or not self._pick_cid:
+                self._pick_cid = self.canvas.mpl_connect('pick_event', self.on_pick)
             
             # Adjust layout and draw
             self.fig.tight_layout()
@@ -1742,7 +1748,8 @@ class HeartbeatMonitor:
             self.canvas.draw()
             self.last_graph_update = current_time
     
-
+        finally:
+            self._graph_rendering = False
     
     def get_filtered_data(self):
         """Get data filtered by current time range with thread-safe access (legacy method)"""
@@ -1967,6 +1974,12 @@ class HeartbeatMonitor:
     def start_monitoring(self):
         """Start the monitoring process"""
         try:
+            # Prevent duplicate monitoring threads
+            if getattr(self, "monitor_thread", None) and self.monitor_thread.is_alive():
+                return
+            if getattr(self, "is_monitoring", False):
+                return
+
             # Validate inputs
             ip = self.config["target_ip"]
             if not ip:
@@ -1998,14 +2011,16 @@ class HeartbeatMonitor:
             # Otherwise, keep existing data and continue monitoring from where we left off
             # This preserves historical data when restarting monitoring
             
-            # Start monitoring thread
+            # Initialize monitoring state
             self.is_monitoring = True
             self.monitoring_start_time = datetime.now()
             self.total_uptime_seconds = 0
             self.total_downtime_seconds = 0
             self.last_status_update = datetime.now()
             self.last_status = None
+            self._collection_in_progress = False
 
+            # Start a background monitoring thread (simple and reliable)
             self.monitor_thread = threading.Thread(target=self.monitor_loop, daemon=True)
             self.monitor_thread.start()
             
@@ -2028,6 +2043,7 @@ class HeartbeatMonitor:
         """Main monitoring loop using the new metrics system"""
         while self.is_monitoring:
             try:
+                loop_start_ts = time.time()
                 current_time = datetime.now()
                 
                 # Use metrics manager to collect all data
@@ -2065,23 +2081,23 @@ class HeartbeatMonitor:
                     self.last_status = ping_result['value']
                     self.last_status_update = current_time
                     
-                    # Add to legacy ping history for compatibility
+                # Add to legacy ping history for compatibility (lock only for append)
                 with self.data_lock:
                     self.ping_history.append({
                         'timestamp': current_time,
                         'status': (ping_result.get('value') if ping_result else 'DOWN')
                     })
+
+                # Update UI (outside lock)
+                self.root.after(0, lambda: self.last_ping_var.set(
+                    f"Last ping: {current_time.strftime('%Y-%m-%d %H:%M:%S')} - {ping_result['value']}"
+                ))
                 
-                    # Update UI
-                    self.root.after(0, lambda: self.last_ping_var.set(
-                        f"Last ping: {current_time.strftime('%Y-%m-%d %H:%M:%S')} - {ping_result['value']}"
-                    ))
-                    
-                    # Record downtime if down
-                    if not is_up:
-                        self.record_downtime(current_time)
-                    else:
-                        self.root.after(0, lambda: self.log_event(f"UP: {current_time.strftime('%Y-%m-%d %H:%M:%S')}", "up"))
+                # Record downtime if down (outside lock to avoid deadlock)
+                if not is_up:
+                    self.record_downtime(current_time)
+                else:
+                    self.root.after(0, lambda: self.log_event(f"UP: {current_time.strftime('%Y-%m-%d %H:%M:%S')}", "up"))
                 
                 # Handle SSH voltage metric
                 ssh_result = results.get('ssh_voltage')
@@ -2123,25 +2139,30 @@ class HeartbeatMonitor:
                     metric = result['metric']
                     if result['success']:
                         formatted_value = metric.format_value(result['value'])
-                        self.log_event(f"{metric.display_name}: {formatted_value}", "metric")
+                        self.root.after(0, lambda m=f"{metric.display_name}: {formatted_value}": self.log_event(m, "metric"))
                     else:
-                        self.log_event(f"{metric.display_name}: FAILED", "metric_fail")
+                        self.root.after(0, lambda m=f"{metric.display_name}: FAILED": self.log_event(m, "metric_fail"))
                 
-                # Auto-save immediately after logging
-                self.auto_save_events()
+                # Auto-save immediately after logging (must run on UI thread since it reads widget text)
+                self.root.after(0, self.auto_save_events)
                 
                 # Schedule graph update (throttled internally)
                 self.root.after(0, lambda: self.optimized_update_graph())
                 
-                # Calculate total interval in seconds
-                total_interval = self.config["ping_interval_minutes"] * 60 + self.config["ping_interval_seconds"]
-                
-                # Wait for next interval
+                # Calculate total interval in seconds (simple sleep to avoid CPU spikes)
+                try:
+                    total_interval = int(self.config.get("ping_interval_minutes", 0)) * 60 + int(self.config.get("ping_interval_seconds", 0))
+                except Exception:
+                    total_interval = 60
+                if total_interval < 1:
+                    total_interval = 60
                 time.sleep(total_interval)
                 
             except Exception as e:
                 self.root.after(0, lambda: self.log_event(f"Error: {e}", "error"))
                 time.sleep(5)  # Wait before retrying
+
+    # Removed Tk-based scheduling; using a single background thread instead
     
     def ping_with_retries(self):
         """Ping with retry logic"""
@@ -2495,12 +2516,24 @@ class HeartbeatMonitor:
         self.update_ssh_stats()
         self.update_current_streak()
         self.update_time_since_down()
-        self.optimized_update_graph()
+        # Avoid forcing a graph render here; the regular UI update timer and
+        # monitor loop will trigger graph updates, preventing extra load.
     
     def clear_events(self):
         """Clear the events display"""
-        self.events_text.delete(1.0, tk.END)
-        self.downtime_events.clear()
+        try:
+            confirm = messagebox.askyesno(
+                "Clear Events",
+                "Are you sure you want to clear all events? This cannot be undone."
+            )
+            if not confirm:
+                return
+
+            self.events_text.delete(1.0, tk.END)
+            self.downtime_events.clear()
+            self.auto_save_events()
+        except Exception:
+            pass
 
     def refresh_data(self):
         """Refresh data from the events log file"""
