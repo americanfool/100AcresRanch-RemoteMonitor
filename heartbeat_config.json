@@ -40,7 +40,8 @@
     "terahash": true,
     "power": true,
     "fan_speed": true,
-    "temperature": true
+    "temperature": true,
+    "efficiency": true
   },
   "api_calls_enabled": {
     "temperature": true,

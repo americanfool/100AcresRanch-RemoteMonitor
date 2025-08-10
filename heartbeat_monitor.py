@@ -15,7 +15,6 @@ import matplotlib.dates as mdates
 from collections import deque
 import paramiko
 import pystray
-import requests
 from abc import ABC, abstractmethod
 
 # Simple lock file for single instance
@@ -443,7 +442,7 @@ class TemperatureMetric(APIMetric):
         return False, None
     
     def get_display_range(self):
-        return (0, 100)
+        return (40, 95)
     
     def format_value(self, value):
         return f"{value:.1f}°C"
@@ -483,7 +482,7 @@ class TerahashMetric(APIMetric):
         return False, None
     
     def get_display_range(self):
-        return (0, 200)  # Adjust based on your miner capacity
+        return (0, 150)
     
     def format_value(self, value):
         return f"{value:.2f} TH/s"
@@ -516,7 +515,7 @@ class FrequencyMetric(APIMetric):
         return False, None
     
     def get_display_range(self):
-        return (0, 2000)
+        return (125, 700)
     
     def format_value(self, value):
         return f"{value:.0f} MHz"
@@ -588,10 +587,35 @@ class PowerMetric(APIMetric):
         return False, None
     
     def get_display_range(self):
-        return (0, 5000)  # Watts
+        return (0, 4000)
     
     def format_value(self, value):
         return f"{value:.0f}W"
+
+
+class EfficiencyMetric(BaseMetric):
+    """Derived metric: Watts per TH (W/TH) computed from Power and TH/s"""
+    
+    def __init__(self):
+        # Use high-contrast color distinct from others
+        super().__init__("efficiency", "W/TH", "black", "^", True)
+    
+    def collect_data(self):
+        """No direct collection; computed in MetricsManager.collect_all_data"""
+        return False, None
+    
+    def validate_value(self, value):
+        try:
+            return isinstance(value, (int, float)) and value >= 0
+        except Exception:
+            return False
+    
+    def get_display_range(self):
+        # Typical miner efficiency range; user-defined
+        return (0, 100)
+    
+    def format_value(self, value):
+        return f"{value:.2f} W/TH"
 
 
 class MetricsManager:
@@ -609,6 +633,7 @@ class MetricsManager:
         self.register_metric(FrequencyMetric())
         self.register_metric(FanSpeedMetric())
         self.register_metric(PowerMetric())
+        self.register_metric(EfficiencyMetric())
     
     def register_metric(self, metric):
         """Register a new metric"""
@@ -633,6 +658,9 @@ class MetricsManager:
             elif metric.name == 'ssh_voltage':
                 # Always collect SSH voltage in main loop
                 should_collect = True
+            elif metric.name == 'efficiency':
+                # Skip direct collection; computed after base metrics are collected
+                continue
             else:
                 # For API metrics, check api_calls_enabled setting
                 should_collect = config.get("api_calls_enabled", {}).get(metric.name, False)
@@ -664,6 +692,32 @@ class MetricsManager:
                     time.sleep(0.1)  # Reduced from 0.5 to 0.1 for less blocking
                 except Exception:
                     pass
+        
+        # Compute derived efficiency (W/TH) if power and TH are available
+        try:
+            eff_metric = self.get_metric('efficiency')
+            power_res = results.get('power')
+            th_res = results.get('terahash')
+            if eff_metric and power_res and th_res and power_res.get('success') and th_res.get('success'):
+                power_val = power_res.get('value')
+                th_val = th_res.get('value')
+                # Ensure numeric and avoid division by zero or None
+                if isinstance(power_val, (int, float)) and isinstance(th_val, (int, float)) and th_val > 0:
+                    efficiency = float(power_val) / float(th_val)
+                    timestamp = datetime.now()
+                    results['efficiency'] = {
+                        'success': True,
+                        'value': efficiency,
+                        'timestamp': timestamp,
+                        'metric': eff_metric
+                    }
+                    with self.data_lock:
+                        eff_metric.data_history.append({
+                            'timestamp': timestamp,
+                            'value': efficiency
+                        })
+        except Exception:
+            pass
         
         return results
 
@@ -1055,7 +1109,8 @@ class HeartbeatMonitor:
                 "terahash": True,
                 "frequency": False,
                 "fan_speed": True,
-                "power": True
+                "power": True,
+                "efficiency": True
             },
             # API call toggles (for data collection)
             "api_calls_enabled": {
@@ -1063,7 +1118,9 @@ class HeartbeatMonitor:
                 "terahash": True,
                 "frequency": False,
                 "fan_speed": True,
-                "power": True
+                "power": True,
+                # Derived metric; no API call needed, but keep key false/unused
+                "efficiency": False
             }
         }
         self.config = self.load_config()
@@ -1136,6 +1193,9 @@ class HeartbeatMonitor:
         
         # Bind window closing event
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+        # Single log file used by Events tab and for histories
+        self.interval_log_file = "events_log.txt"
     
     def _update_metrics_from_config(self):
         """Update metrics enabled state from config"""
@@ -1225,35 +1285,33 @@ class HeartbeatMonitor:
         
         self.current_state_var = tk.StringVar(value="Current: N/A")
         self.current_state_label = ttk.Label(status_row1, textvariable=self.current_state_var, font=("Arial", 10, "bold"))
-        self.current_state_label.pack(side=tk.RIGHT)
+        self.current_state_label.pack(side=tk.RIGHT, padx=(10, 0))
         
-        # Status row 2 - Total uptime and downtime percentages
-        status_row2 = ttk.Frame(status_frame)
-        status_row2.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(0, 5))
-        
+        # Total downtime percentage moved into first row to reduce height
         self.uptime_var = tk.StringVar(value="Total Uptime: 0s (0%)")
-        self.uptime_label = ttk.Label(status_row2, textvariable=self.uptime_var, font=("Arial", 10))
-        self.uptime_label.pack(side=tk.LEFT)
-        
         self.downtime_var = tk.StringVar(value="Total Downtime: 0s (0%)")
-        self.downtime_label = ttk.Label(status_row2, textvariable=self.downtime_var, font=("Arial", 10))
-        self.downtime_label.pack(side=tk.RIGHT)
+        self.downtime_label = ttk.Label(status_row1, textvariable=self.downtime_var, font=("Arial", 10))
+        self.downtime_label.pack(side=tk.LEFT, padx=(10, 0))
         
         # Status row 3 - Window statistics
         status_row3 = ttk.Frame(status_frame)
-        status_row3.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=(0, 5))
+        status_row3.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(0, 5))
         
-        self.window_stats_var = tk.StringVar(value="Window: 0 UP / 0 DOWN (0%)")
+        self.window_stats_var = tk.StringVar(value="Ping: 0 UP / 0 DOWN (0%)")
         self.window_stats_label = ttk.Label(status_row3, textvariable=self.window_stats_var)
         self.window_stats_label.pack(side=tk.LEFT)
         
+        # Window averages
+        self.window_eff_var = tk.StringVar(value="Avg W/TH: N/A")
+        self.window_eff_label = ttk.Label(status_row3, textvariable=self.window_eff_var, font=("Arial", 10, "bold"))
+        self.window_eff_label.pack(side=tk.RIGHT, padx=(0, 10))
         self.window_th_var = tk.StringVar(value="Avg TH/s: N/A")
         self.window_th_label = ttk.Label(status_row3, textvariable=self.window_th_var, font=("Arial", 10, "bold"))
         self.window_th_label.pack(side=tk.RIGHT)
         
         # Status row 4 - Last readings for metrics
         status_row4 = ttk.Frame(status_frame)
-        status_row4.grid(row=3, column=0, sticky=(tk.W, tk.E), pady=(0, 5))
+        status_row4.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=(0, 5))
         
         self.last_ping_var = tk.StringVar(value="Ping: Never")
         self.last_ping_label = ttk.Label(status_row4, textvariable=self.last_ping_var)
@@ -1269,7 +1327,7 @@ class HeartbeatMonitor:
         
         # Status row 5 - More last readings
         status_row5 = ttk.Frame(status_frame)
-        status_row5.grid(row=4, column=0, sticky=(tk.W, tk.E))
+        status_row5.grid(row=3, column=0, sticky=(tk.W, tk.E))
         
         self.last_th_var = tk.StringVar(value="TH/s: N/A")
         self.last_th_label = ttk.Label(status_row5, textvariable=self.last_th_var)
@@ -1285,7 +1343,12 @@ class HeartbeatMonitor:
         
         self.last_power_var = tk.StringVar(value="Power: N/A")
         self.last_power_label = ttk.Label(status_row5, textvariable=self.last_power_var)
-        self.last_power_label.pack(side=tk.LEFT)
+        self.last_power_label.pack(side=tk.LEFT, padx=(0, 10))
+
+        # Last Efficiency (W/TH)
+        self.last_efficiency_var = tk.StringVar(value="W/TH: N/A")
+        self.last_efficiency_label = ttk.Label(status_row5, textvariable=self.last_efficiency_var)
+        self.last_efficiency_label.pack(side=tk.LEFT)
         
         # Create notebook for tabs
         notebook = ttk.Notebook(main_frame)
@@ -1327,7 +1390,7 @@ class HeartbeatMonitor:
                 variable=var,
                 command=lambda name=metric_name: self.on_metric_toggle(name)
             )
-            checkbox.grid(row=i//3, column=i%3, sticky=tk.W, padx=5, pady=2)
+            checkbox.grid(row=i//4, column=i%4, sticky=tk.W, padx=5, pady=2)
         
 
         
@@ -1434,6 +1497,8 @@ class HeartbeatMonitor:
                     self.last_fan_var.set(f"Fan: {value:.0f}%")
                 elif metric_name == 'power' and value is not None:
                     self.last_power_var.set(f"Power: {value:.0f}W")
+                elif metric_name == 'efficiency' and value is not None:
+                    self.last_efficiency_var.set(f"W/TH: {value:.2f}")
     
     def format_duration(self, seconds):
         """Format seconds into a readable duration string"""
@@ -1477,7 +1542,7 @@ class HeartbeatMonitor:
         # Calculate window average uptime
         if total_window_pings > 0:
             window_avg = (up_count / total_window_pings) * 100
-            self.window_stats_var.set(f"Window: {up_count} UP / {down_count} DOWN ({window_avg:.1f}%)")
+            self.window_stats_var.set(f"Ping: {up_count} UP / {down_count} DOWN ({window_avg:.1f}%)")
             
             # Calculate average TH/s for window if available
             th_metric = self.metrics_manager.get_metric('terahash')
@@ -1490,91 +1555,35 @@ class HeartbeatMonitor:
                             th_sum += data_point['value']
                             th_count += 1
                 
-                if th_count > 0:
-                    avg_th = th_sum / th_count
-                    self.window_th_var.set(f"Avg TH/s: {avg_th:.2f}")
-                else:
-                    self.window_th_var.set("Avg TH/s: N/A")
+                # Include DOWN/missing points as zeros by dividing by total pings in window
+                avg_th = th_sum / total_window_pings
+                self.window_th_var.set(f"Avg TH/s: {avg_th:.2f}")
             else:
                 self.window_th_var.set("Avg TH/s: N/A")
+
+            # Calculate average W/TH for window (count only when UP)
+            eff_metric = self.metrics_manager.get_metric('efficiency')
+            if eff_metric:
+                eff_sum = 0.0
+                eff_count = 0
+                with self.metrics_manager.data_lock:
+                    for data_point in eff_metric.data_history:
+                        if data_point['timestamp'] >= time_cutoff and data_point.get('value') is not None:
+                            eff_sum += float(data_point['value'])
+                            eff_count += 1
+                if eff_count > 0:
+                    avg_eff = eff_sum / eff_count
+                    self.window_eff_var.set(f"Avg W/TH: {avg_eff:.2f}")
+                else:
+                    self.window_eff_var.set("Avg W/TH: N/A")
         else:
-            self.window_stats_var.set("Window: No data")
+            self.window_stats_var.set("Ping: No data")
             self.window_th_var.set("Avg TH/s: N/A")
+            self.window_eff_var.set("Avg W/TH: N/A")
     
-    def auto_save_events(self):
-        """Auto-save events to file immediately"""
-        try:
-            # Read widget text on UI thread quickly, then write on a background thread
-            content = self.events_text.get(1.0, tk.END)
-            def _write_file(data: str):
-                try:
-                    with open("events_log.txt", 'w', encoding='utf-8') as f:
-                        f.write(data)
-                        f.flush()
-                except Exception as ex:
-                    # Defer error logging to UI thread
-                    self.root.after(0, lambda: self.log_event(f"Auto-save failed: {ex}", "error"))
-            threading.Thread(target=_write_file, args=(content,), daemon=True).start()
-        except Exception as e:
-            self.root.after(0, lambda: self.log_event(f"Auto-save failed: {e}", "error"))
+    # Removed auto_save_events; interval logging handles persistence
     
-    def update_time_since_down(self):
-        """Update the time since last down display"""
-        if self.last_down_time:
-            time_diff = datetime.now() - self.last_down_time
-            hours = int(time_diff.total_seconds() // 3600)
-            minutes = int((time_diff.total_seconds() % 3600) // 60)
-            seconds = int(time_diff.total_seconds() % 60)
-            
-            if hours > 0:
-                time_str = f"{hours}h {minutes}m {seconds}s"
-            elif minutes > 0:
-                time_str = f"{minutes}m {seconds}s"
-            else:
-                time_str = f"{seconds}s"
-            
-            self.time_since_down_var.set(f"Time since last down: {time_str}")
-        else:
-            self.time_since_down_var.set("Time since last down: Never")
-    
-    def update_uptime_percentage(self):
-        """Update uptime percentage display"""
-        if self.total_pings > 0:
-            uptime_pct = (self.successful_pings / self.total_pings) * 100
-            self.uptime_var.set(f"Uptime: {uptime_pct:.1f}%")
-        else:
-            self.uptime_var.set("Uptime: 0%")
-    
-    def update_ping_stats(self):
-        """Update ping statistics display"""
-        if self.total_pings > 0:
-            success_rate = (self.successful_pings / self.total_pings) * 100
-            self.ping_stats_var.set(f"Pings: {self.successful_pings}/{self.total_pings} ({success_rate:.1f}%)")
-        else:
-            self.ping_stats_var.set("Pings: 0/0 (0%)")
-    
-    def update_ssh_stats(self):
-        """Update SSH statistics display"""
-        if self.total_ssh > 0:
-            success_rate = (self.successful_ssh / self.total_ssh) * 100
-            self.ssh_stats_var.set(f"SSH: {self.successful_ssh}/{self.total_ssh} ({success_rate:.1f}%)")
-        else:
-            self.ssh_stats_var.set("SSH: 0/0 (0%)")
-    
-    def update_current_streak(self):
-        """Update current successful ping streak"""
-        if not self.ping_history:
-            self.current_streak_var.set("Current streak: 0 pings")
-            return
-        
-        streak = 0
-        for ping_result in reversed(self.ping_history):
-            if ping_result['status'] == 'UP':
-                streak += 1
-            else:
-                break
-        
-        self.current_streak_var.set(f"Current streak: {streak} pings")
+    # Removed unused legacy UI statistic update helpers
     
     def optimized_update_graph(self, force_update=False):
         """Update the live monitoring graph with simple throttling"""
@@ -1615,12 +1624,26 @@ class HeartbeatMonitor:
             
             # Get filtered data for all enabled metrics
             filtered_data = self.get_filtered_metrics_data()
-            
+
+            # Compute window bounds for x-axis
+            now_dt = datetime.now()
+            cutoff = self.get_time_cutoff(now_dt)
+            is_fixed_window = self.time_range_var.get() != "All Data"
+
+            # If no data at all across all metrics, render a simple empty state
             if not any(data['times'] for data in filtered_data.values()):
-                # Show no data message
                 self.ax.set_title(f'Live Monitoring - {self.current_time_range} (No data)')
                 self.ax.set_xlabel('Time')
-                self.ax.set_ylabel('Mixed Metrics')
+                self.ax.set_ylabel('Normalized Value (%)')
+                # Respect selected time range on x-axis even with no data
+                try:
+                    if is_fixed_window:
+                        self.ax.set_xlim(cutoff, now_dt)
+                    else:
+                        # All Data with no points: default to last hour
+                        self.ax.set_xlim(now_dt - timedelta(hours=1), now_dt)
+                except Exception:
+                    pass
                 self.ax.grid(True, alpha=0.3)
                 self.fig.tight_layout()
                 self.canvas.draw()
@@ -1657,15 +1680,35 @@ class HeartbeatMonitor:
                     for tval, status in zip(data['times'], data['values']):
                         if status == 'UP':
                             up_times.append(tval)
-                            up_statuses.append(90)  # Show at 90% on normalized scale
+                            up_statuses.append(100)  # Map UP to 100 on normalized scale
                         else:
                             down_times.append(tval)
-                            down_statuses.append(10)  # Show at 10% on normalized scale
+                            down_statuses.append(0)  # Map DOWN to 0 on normalized scale
                     
                     if up_times:
-                        self.ax.plot(up_times, up_statuses, 'go', markersize=8, label='Ping UP', picker=5)
+                        self.ax.plot(
+                            up_times,
+                            up_statuses,
+                            'go',
+                            markersize=6,
+                            markeredgecolor='white',
+                            markeredgewidth=0.7,
+                            alpha=0.85,
+                            label='Ping UP',
+                            picker=5,
+                        )
                     if down_times:
-                        self.ax.plot(down_times, down_statuses, 'ro', markersize=8, label='Ping DOWN', picker=5)
+                        self.ax.plot(
+                            down_times,
+                            down_statuses,
+                            'ro',
+                            markersize=6,
+                            markeredgecolor='white',
+                            markeredgewidth=0.7,
+                            alpha=0.85,
+                            label='Ping DOWN',
+                            picker=5,
+                        )
                 else:
                     # Sort data by time to ensure proper line connections
                     if data['times'] and data['values']:
@@ -1690,8 +1733,11 @@ class HeartbeatMonitor:
                             color=metric.color, 
                             marker=metric.marker_style, 
                             linestyle='-',
-                            linewidth=2, 
-                            markersize=6, 
+                            linewidth=1.25,
+                            markersize=4,
+                            alpha=0.85,
+                            markeredgecolor='white',
+                            markeredgewidth=0.6,
                             label=f"{metric.display_name}", 
                             picker=5
                         )[0]
@@ -1701,6 +1747,32 @@ class HeartbeatMonitor:
                         line.metric_name = metric.display_name
                         line.metric = metric
             
+            # If nothing was plotted (e.g., all toggles disabled), render a friendly empty state
+            if total_points == 0:
+                self.ax.set_ylim(0, 100)
+                self.ax.set_xlabel('Time')
+                self.ax.set_ylabel('Normalized Value (%)')
+                self.ax.set_title(f'Live Monitoring - {self.current_time_range} (No metrics selected)')
+                try:
+                    if is_fixed_window:
+                        self.ax.set_xlim(cutoff, now_dt)
+                    else:
+                        # All Data: if no series plotted, default to last hour
+                        self.ax.set_xlim(now_dt - timedelta(hours=1), now_dt)
+                except Exception:
+                    pass
+                self.ax.grid(True, alpha=0.3)
+                self.fig.tight_layout()
+                self.canvas.draw()
+                self.last_graph_update = current_time
+                self._last_displayed_range = self.current_time_range
+                self.graph_update_pending = False
+                if self.is_monitoring:
+                    self.status_var.set("Monitoring...")
+                else:
+                    self.status_var.set("Ready")
+                return
+
             # Set up the graph with normalized scale
             self.ax.set_ylim(0, 100)
             self.ax.set_xlabel('Time')
@@ -1710,11 +1782,35 @@ class HeartbeatMonitor:
             title = f'Live Monitoring - {self.current_time_range} ({total_points} points)'
             self.ax.set_title(title)
             self.ax.grid(True, alpha=0.3)
-            self.ax.legend(loc='lower left')
+            # Only show legend if there are plotted handles
+            try:
+                handles, labels = self.ax.get_legend_handles_labels()
+                if handles:
+                    self.ax.legend(loc='lower left')
+            except Exception:
+                pass
             
-            # Simple x-axis formatting using first available metric data
-            first_times = next((data['times'] for data in filtered_data.values() if data['times']), [])
-            self.setup_x_axis_format(first_times)
+            # X-axis: enforce selected window bounds and format ticks based on the window
+            try:
+                if is_fixed_window:
+                    self.ax.set_xlim(cutoff, now_dt)
+                    self.setup_x_axis_format([cutoff, now_dt])
+                else:
+                    # All Data window: fit to data span
+                    all_times = []
+                    for line in self.ax.get_lines():
+                        xs = list(getattr(line, 'get_xdata')()) if hasattr(line, 'get_xdata') else []
+                        if xs:
+                            all_times.extend(xs)
+                    if all_times:
+                        self.ax.set_xlim(min(all_times), max(all_times))
+                        self.setup_x_axis_format([min(all_times), max(all_times)])
+                    else:
+                        # No data at all, fallback to last hour
+                        self.ax.set_xlim(now_dt - timedelta(hours=1), now_dt)
+                        self.setup_x_axis_format([now_dt - timedelta(hours=1), now_dt])
+            except Exception:
+                pass
             
             # Enable tooltips (connect once)
             if not hasattr(self, '_pick_cid') or not self._pick_cid:
@@ -1751,21 +1847,6 @@ class HeartbeatMonitor:
         finally:
             self._graph_rendering = False
     
-    def get_filtered_data(self):
-        """Get data filtered by current time range with thread-safe access (legacy method)"""
-        # Calculate time cutoff based on selected range
-        now = datetime.now()
-        time_cutoff = self.get_time_cutoff(now)
-        
-        # Use helper methods for thread-safe data access
-        filtered_ping_times, filtered_ping_statuses = self._get_filtered_ping_data(time_cutoff)
-        filtered_ssh_times, filtered_ssh_voltages = self._get_filtered_ssh_data(time_cutoff)
-        
-        return {
-            'ping': {'times': filtered_ping_times, 'statuses': filtered_ping_statuses},
-            'ssh': {'times': filtered_ssh_times, 'voltages': filtered_ssh_voltages}
-        }
-    
     def get_filtered_metrics_data(self):
         """Get filtered data for all metrics using the new metrics system"""
         # Calculate time cutoff based on selected range
@@ -1793,32 +1874,6 @@ class HeartbeatMonitor:
                 }
         
         return filtered_data
-    
-    def _get_filtered_ping_data(self, time_cutoff):
-        """Thread-safe method to get filtered ping data"""
-        with self.data_lock:
-            filtered_times = []
-            filtered_statuses = []
-            
-            for ping in self.ping_history:
-                if ping['timestamp'] >= time_cutoff:
-                    filtered_times.append(ping['timestamp'])
-                    filtered_statuses.append(ping['status'])
-            
-            return filtered_times, filtered_statuses
-    
-    def _get_filtered_ssh_data(self, time_cutoff):
-        """Thread-safe method to get filtered SSH data"""
-        with self.data_lock:
-            filtered_times = []
-            filtered_voltages = []
-            
-            for ssh in self.ssh_history:
-                if ssh['timestamp'] >= time_cutoff and ssh['status'] == 'SUCCESS' and ssh['voltage'] is not None:
-                    filtered_times.append(ssh['timestamp'])
-                    filtered_voltages.append(ssh['voltage'])
-            
-            return filtered_times, filtered_voltages
     
     def get_time_cutoff(self, now):
         """Calculate time cutoff based on selected time range"""
@@ -1852,30 +1907,33 @@ class HeartbeatMonitor:
     def setup_x_axis_format(self, times):
         """Setup x-axis formatting based on actual data times"""
         if not times:
-            # No data, use default formatting
+            # No data, use default formatting (time only)
             self.ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
             self.ax.xaxis.set_major_locator(mdates.MinuteLocator(interval=5))
             plt.setp(self.ax.xaxis.get_majorticklabels(), rotation=45)
             return
-        
+
         # Calculate actual time span of data
         min_time = min(times)
         max_time = max(times)
-        time_span = max_time - min_time
-        
-        # Simple formatting with limited ticks to prevent overload
-        self.ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
-        
-        # Always use reasonable intervals regardless of time span
-        if time_span.total_seconds() <= 3600:  # 1 hour or less
+        time_span_seconds = (max_time - min_time).total_seconds()
+
+        # Keep existing look for up to a day; include date when spanning multiple days
+        if time_span_seconds <= 3600:  # <= 1 hour
             self.ax.xaxis.set_major_locator(mdates.MinuteLocator(interval=10))
-        elif time_span.total_seconds() <= 86400:  # 1 day or less
+            self.ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+        elif time_span_seconds <= 86400:  # <= 1 day
             self.ax.xaxis.set_major_locator(mdates.HourLocator(interval=2))
+            self.ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+        elif time_span_seconds <= 3 * 86400:  # <= 3 days
+            # Show date and time to make cross-day context clear
+            self.ax.xaxis.set_major_locator(mdates.HourLocator(interval=6))
+            self.ax.xaxis.set_major_formatter(mdates.DateFormatter('%m/%d %H:%M'))
         else:
-            # For longer spans, use day intervals to prevent tick explosion
+            # Longer spans: show day ticks with date
             self.ax.xaxis.set_major_locator(mdates.DayLocator(interval=1))
             self.ax.xaxis.set_major_formatter(mdates.DateFormatter('%m/%d'))
-        
+
         plt.setp(self.ax.xaxis.get_majorticklabels(), rotation=45)
     
     def on_time_range_change(self, event=None):
@@ -1930,20 +1988,19 @@ class HeartbeatMonitor:
                 
                 # Format the tooltip based on the line type
                 if 'Ping UP' in artist.get_label():
-                    tooltip_text = f"Ping: UP\nTime: {x.strftime('%H:%M:%S')}\nStatus: Online"
+                    tooltip_text = f"Ping: UP\nTime: {x.strftime('%Y-%m-%d %H:%M:%S')}\nStatus: Online"
                 elif 'Ping DOWN' in artist.get_label():
-                    tooltip_text = f"Ping: DOWN\nTime: {x.strftime('%H:%M:%S')}\nStatus: Offline"
+                    tooltip_text = f"Ping: DOWN\nTime: {x.strftime('%Y-%m-%d %H:%M:%S')}\nStatus: Offline"
                 else:
-                    # Check if this line has original values stored (for normalized metrics)
+                    # Prefer showing original (unnormalized) metric values
                     if hasattr(artist, 'original_values') and hasattr(artist, 'metric'):
                         original_value = artist.original_values[ind]
                         metric = artist.metric
                         formatted_value = metric.format_value(original_value)
-                        tooltip_text = f"{metric.display_name}\nTime: {x.strftime('%H:%M:%S')}\nValue: {formatted_value}\nNormalized: {y:.1f}%"
-                    elif 'Voltage' in artist.get_label():
-                        tooltip_text = f"SSH Voltage Reading\nTime: {x.strftime('%H:%M:%S')}\nVoltage: {y:.2f}V\nStatus: Active"
+                        tooltip_text = f"{metric.display_name}\nTime: {x.strftime('%Y-%m-%d %H:%M:%S')}\nValue: {formatted_value}"
                     else:
-                        tooltip_text = f"Time: {x.strftime('%H:%M:%S')}\nValue: {y}"
+                        # Fallback only if original values are unavailable
+                        tooltip_text = f"Time: {x.strftime('%Y-%m-%d %H:%M:%S')}\nValue: {y}"
                 
                 # Get current mouse position relative to the main window
                 mouse_x = self.root.winfo_pointerx()
@@ -2143,8 +2200,15 @@ class HeartbeatMonitor:
                     else:
                         self.root.after(0, lambda m=f"{metric.display_name}: FAILED": self.log_event(m, "metric_fail"))
                 
-                # Auto-save immediately after logging (must run on UI thread since it reads widget text)
-                self.root.after(0, self.auto_save_events)
+                # Build and append compact interval log line (single timestamp per interval)
+                try:
+                    interval_line = self._format_interval_line(current_time, results)
+                    if interval_line:
+                        self._append_interval_log(interval_line)
+                except Exception:
+                    pass
+
+                # Persistence is handled by interval logging only
                 
                 # Schedule graph update (throttled internally)
                 self.root.after(0, lambda: self.optimized_update_graph())
@@ -2164,54 +2228,7 @@ class HeartbeatMonitor:
 
     # Removed Tk-based scheduling; using a single background thread instead
     
-    def ping_with_retries(self):
-        """Ping with retry logic"""
-        for attempt in range(self.config["retry_count"] + 1):
-            try:
-                result = ping(self.config["target_ip"], timeout=2)
-                if result is not None:
-                    return True
-            except:
-                pass
-            
-            if attempt < self.config["retry_count"]:
-                time.sleep(self.config["retry_delay"])
-        
-        return False
-    
-    def ssh_with_retries(self):
-        """SSH with retry logic"""
-        for attempt in range(self.config["retry_count"] + 1):
-            try:
-                ssh = paramiko.SSHClient()
-                ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-                
-                ssh.connect(
-                    self.config.get("target_ip", self.config.get("ssh_host", "")),  # Use target_ip, fallback to ssh_host for backward compatibility
-                    username=self.config["ssh_username"],
-                    password=self.config["ssh_password"],
-                    timeout=self.config["ssh_timeout"]
-                )
-                
-                stdin, stdout, stderr = ssh.exec_command(self.config["ssh_command"])
-                output = stdout.read().decode().strip()
-                ssh.close()
-                
-                # Parse voltage from output (expecting a number between 11.5 and 14.2)
-                try:
-                    voltage = float(output)
-                    if 11.5 <= voltage <= 14.2:
-                        return 'SUCCESS', voltage
-                    else:
-                        return 'FAILED', None
-                except ValueError:
-                    return 'FAILED', None
-                
-            except Exception as e:
-                if attempt < self.config["retry_count"]:
-                    time.sleep(self.config["retry_delay"])
-        
-        return 'FAILED', None
+    # Removed unused legacy retry helpers
     
     def record_downtime(self, timestamp):
         """Record a downtime event with thread-safe access"""
@@ -2286,238 +2303,82 @@ class HeartbeatMonitor:
             self.events_text.tag_config("metric_fail_event", foreground="red", font=("Arial", 9, "bold"))
         
         self.events_text.see(tk.END)
+
+    def _format_interval_line(self, tick_dt, results):
+        """Create compact single-line log for one interval.
+        Format: YYYY-MM-DD HH:MM:SS ping=UP ssh=11.98 th=69.06 temp=80.0 fan=66 power=1902 eff=27.54
+        Only include tokens for values that were collected successfully.
+        """
+        try:
+            ts_str = tick_dt.strftime('%Y-%m-%d %H:%M:%S')
+            tokens = []
+
+            # ping
+            ping_res = results.get('ping')
+            if ping_res and ping_res.get('success'):
+                tokens.append(f"ping={ping_res.get('value')}")
+
+            # volts (SSH voltage)
+            ssh_res = results.get('ssh_voltage')
+            if self.config.get('ssh_enabled', False):
+                if ssh_res and ssh_res.get('success') and isinstance(ssh_res.get('value'), (int, float)):
+                    tokens.append(f"volts={ssh_res.get('value'):.2f}")
+                else:
+                    tokens.append("volts=DOWN")
+
+            # metrics
+            def _append_metric(key, token, fmt='{:g}'):
+                res = results.get(key)
+                if res and res.get('success') and isinstance(res.get('value'), (int, float)):
+                    try:
+                        tokens.append(f"{token}={fmt.format(res.get('value'))}")
+                    except Exception:
+                        pass
+
+            _append_metric('terahash', 'th', '{:.2f}')
+            _append_metric('temperature', 'temp', '{:.1f}')
+            _append_metric('frequency', 'freq', '{:.0f}')
+            _append_metric('fan_speed', 'fan', '{:.0f}')
+            _append_metric('power', 'watts', '{:.0f}')
+            _append_metric('efficiency', 'w/th', '{:.2f}')
+
+            line = ts_str + ' ' + ' | '.join(tokens)
+            return line
+        except Exception:
+            return None
+
+    def _append_interval_log(self, line: str):
+        """Append one interval line to the compact intervals log file."""
+        try:
+            with open(self.interval_log_file, 'a', encoding='utf-8') as f:
+                # Write the interval line followed by an extra blank line for readability
+                f.write(line + '\n\n')
+            # Also mirror the same line into the Events tab (UI-safe via after)
+            try:
+                self.root.after(0, lambda l=line: (self.events_text.insert(tk.END, l + '\n\n'), self.events_text.see(tk.END)))
+            except Exception:
+                pass
+        except Exception:
+            pass
     
     def load_existing_data(self):
         """Load existing event log data from file"""
         try:
-            if os.path.exists("events_log.txt"):
-                with open("events_log.txt", 'r', encoding='utf-8') as f:
+            # Load the single log file into the Events tab and histories
+            log_path = getattr(self, 'interval_log_file', 'events_log.txt')
+            if os.path.exists(log_path):
+                with open(log_path, 'r', encoding='utf-8') as f:
                     content = f.read()
                     if content.strip():
                         self.events_text.delete(1.0, tk.END)
                         self.events_text.insert(1.0, content)
-                        
-                        # Parse the loaded data to reconstruct history
-                        self.parse_existing_events(content)
+                        # Populate histories from the same file
+                        self.load_intervals_to_histories()
                         
         except Exception as e:
             pass  # Error logging handled by secure logging system
     
-    def parse_existing_events(self, content):
-        """Parse existing event log to reconstruct monitoring history"""
-        lines = content.strip().split('\n')
-        
-        # Limit to last 1000 lines to prevent graph overload
-        if len(lines) > 1000:
-            lines = lines[-1000:]
-        ping_count = 0
-        ssh_count = 0
-        successful_pings = 0
-        successful_ssh = 0
-        previous_timestamp = None
-        
-        # Get metric references
-        ping_metric = self.metrics_manager.get_metric('ping')
-        ssh_metric = self.metrics_manager.get_metric('ssh_voltage')
-        temp_metric = self.metrics_manager.get_metric('temperature')
-        th_metric = self.metrics_manager.get_metric('terahash')
-        freq_metric = self.metrics_manager.get_metric('frequency')
-        fan_metric = self.metrics_manager.get_metric('fan_speed')
-        power_metric = self.metrics_manager.get_metric('power')
-        
-
-        
-        for line in lines:
-            if not line.strip():
-                continue
-                
-            # Parse timestamp and event
-            try:
-                # Extract timestamp from the beginning of line
-                if line.startswith('[') and ']' in line:
-                    timestamp_str = line.split('[')[1].split(']')[0].strip()
-                    
-                    # Try to extract actual date from the event data
-                    actual_date = None
-                    if 'UP:' in line or 'DOWN:' in line:
-                        # Extract date from UP/DOWN events: "UP: 2025-08-04 12:07:07"
-                        try:
-                            date_part = line.split('UP:')[1].strip() if 'UP:' in line else line.split('DOWN:')[1].strip()
-                            actual_date = datetime.strptime(date_part, '%Y-%m-%d %H:%M:%S')
-                            previous_timestamp = actual_date  # Store for SSH events
-                        except:
-                            pass
-                    elif 'SSH:' in line:
-                        # For SSH events, use the previous timestamp if available
-                        if previous_timestamp:
-                            actual_date = previous_timestamp
-                    
-                    # If we found an actual date, use it; otherwise use today's date
-                    if actual_date:
-                        timestamp = actual_date
-                    else:
-                        try:
-                            # Parse timestamp (HH:MM:SS format) and use today's date
-                            timestamp = datetime.strptime(timestamp_str, '%H:%M:%S')
-                            today = datetime.now().date()
-                            timestamp = timestamp.replace(year=today.year, month=today.month, day=today.day)
-                        except ValueError:
-                            # Try alternative timestamp format (YYYY-MM-DD HH:MM:SS)
-                            try:
-                                timestamp = datetime.strptime(timestamp_str, '%Y-%m-%d %H:%M:%S')
-                            except ValueError:
-                                continue
-                    
-                    # Parse event type
-                    if 'UP:' in line:
-                        ping_count += 1
-                        successful_pings += 1
-                        self.ping_history.append({
-                            'timestamp': timestamp,
-                            'status': 'UP'
-                        })
-                        # Add to metrics system
-                        if ping_metric:
-                            ping_metric.data_history.append({
-                                'timestamp': timestamp,
-                                'value': 'UP'
-                            })
-                        
-                    elif 'DOWN:' in line:
-                        ping_count += 1
-                        self.ping_history.append({
-                            'timestamp': timestamp,
-                            'status': 'DOWN'
-                        })
-                        self.last_down_time = timestamp
-                        # Add to metrics system
-                        if ping_metric:
-                            ping_metric.data_history.append({
-                                'timestamp': timestamp,
-                                'value': 'DOWN'
-                            })
-                        
-                    elif ('SSH:' in line or 'Voltage:' in line) and 'V' in line:
-                        ssh_count += 1
-                        successful_ssh += 1
-                        # Extract voltage value
-                        try:
-                            if 'SSH:' in line:
-                                voltage_str = line.split('SSH:')[1].split('V')[0].strip()
-                            else:
-                                voltage_str = line.split('Voltage:')[1].split('V')[0].strip()
-                            voltage = float(voltage_str)
-                            self.ssh_history.append({
-                                'timestamp': timestamp,
-                                'status': 'SUCCESS',
-                                'voltage': voltage
-                            })
-                            # Add to metrics system
-                            if ssh_metric:
-                                ssh_metric.data_history.append({
-                                    'timestamp': timestamp,
-                                    'value': voltage
-                                })
-                        except:
-                            pass
-                    
-                    # Parse new metric types
-                    elif 'Temperature' in line and '°C' in line:
-                        try:
-                            # Format: "Temperature (°C): 56.0°C"
-                            temp_str = line.split(':')[-1].replace('°C', '').strip()
-                            temp_value = float(temp_str)
-                            if temp_metric:
-                                temp_metric.data_history.append({
-                                    'timestamp': timestamp,
-                                    'value': temp_value
-                                })
-                        except:
-                            pass
-                    
-                    elif 'TH/s:' in line:
-                        try:
-                            # Format: "TH/s: 69.06 TH/s" or "TH/s: FAILED"
-                            if 'FAILED' not in line:
-                                th_str = line.split('TH/s:')[1].replace('TH/s', '').strip()
-                                th_value = float(th_str)
-                                if th_metric:
-                                    th_metric.data_history.append({
-                                        'timestamp': timestamp,
-                                        'value': th_value
-                                    })
-                        except:
-                            pass
-                    
-                    elif 'Freq' in line and 'MHz' in line:
-                        try:
-                            # Format: "Freq (MHz): 325 MHz" or "Freq (MHz): FAILED"
-                            if 'FAILED' not in line:
-                                freq_str = line.split(':')[-1].replace('MHz', '').strip()
-                                freq_value = float(freq_str)
-                                if freq_metric:
-                                    freq_metric.data_history.append({
-                                        'timestamp': timestamp,
-                                        'value': freq_value
-                                    })
-                        except:
-                            pass
-                    
-                    elif 'Fan' in line and '%' in line:
-                        try:
-                            # Format: "Fan (%): 66%" or "Fan (%): FAILED"
-                            if 'FAILED' not in line:
-                                fan_str = line.split(':')[-1].replace('%', '').strip()
-                                fan_value = float(fan_str)
-                                if fan_metric:
-                                    fan_metric.data_history.append({
-                                        'timestamp': timestamp,
-                                        'value': fan_value
-                                    })
-                        except:
-                            pass
-                    
-                    elif 'Power' in line and 'W' in line:
-                        try:
-                            # Format: "Power (W): 1902W" or "Power (W): FAILED"
-                            if 'FAILED' not in line:
-                                power_str = line.split(':')[-1].replace('W', '').strip()
-                                power_value = float(power_str)
-                                if power_metric:
-                                    power_metric.data_history.append({
-                                        'timestamp': timestamp,
-                                        'value': power_value
-                                    })
-                        except:
-                            pass
-                            
-                    elif 'SSH: FAILED' in line or 'Voltage: FAILED' in line:
-                        ssh_count += 1
-                        self.ssh_history.append({
-                            'timestamp': timestamp,
-                            'status': 'FAILED',
-                            'voltage': None
-                        })
-                            
-            except Exception as e:
-                continue
-        
-
-        
-        # Update statistics
-        self.total_pings = ping_count
-        self.successful_pings = successful_pings
-        self.total_ssh = ssh_count
-        self.successful_ssh = successful_ssh
-        
-        # Update UI
-        self.update_uptime_percentage()
-        self.update_ping_stats()
-        self.update_ssh_stats()
-        self.update_current_streak()
-        self.update_time_since_down()
-        # Avoid forcing a graph render here; the regular UI update timer and
-        # monitor loop will trigger graph updates, preventing extra load.
+    # Removed legacy parser (now using compact format only)
     
     def clear_events(self):
         """Clear the events display"""
@@ -2552,7 +2413,7 @@ class HeartbeatMonitor:
             self.successful_ssh = 0
             self.last_down_time = None
             
-            # Now load fresh data
+            # Now load fresh data from the single log file
             self.load_existing_data()
             
             # Force immediate graph update
@@ -2564,6 +2425,80 @@ class HeartbeatMonitor:
             self.root.after(2000, lambda: self.status_var.set("Ready" if not self.is_monitoring else "Monitoring..."))
         except Exception as e:
             pass  # Error logging handled by secure logging system
+
+    def load_intervals_to_histories(self):
+        """Parse the single events log (current compact format) and populate histories/metrics."""
+        try:
+            path = getattr(self, 'interval_log_file', 'events_log.txt')
+            if not os.path.exists(path):
+                return
+            with open(path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    # Expect compact interval format only: YYYY-MM-DD HH:MM:SS tokens separated by ' | '
+                    if not (len(line) >= 19 and line[4] == '-' and line[7] == '-' and line[10] == ' ' and line[13] == ':' and line[16] == ':'):
+                        continue
+                    try:
+                        ts_str, rest = line[:19], line[20:]
+                        ts = datetime.strptime(ts_str, '%Y-%m-%d %H:%M:%S')
+                    except Exception:
+                        continue
+
+                    tokens = {}
+                    for token in [t.strip() for t in rest.split('|') if t.strip()]:
+                        if '=' in token:
+                            k, v = token.split('=', 1)
+                            tokens[k.strip()] = v.strip()
+
+                    # ping
+                    ping_status = tokens.get('ping')
+                    if ping_status in ('UP', 'DOWN'):
+                        self.ping_history.append({'timestamp': ts, 'status': ping_status})
+
+                    # volts (ssh voltage)
+                    volts_val = tokens.get('volts')
+                    if volts_val is not None:
+                        if volts_val.upper() in ('DOWN', 'FAIL'):
+                            self.ssh_history.append({'timestamp': ts, 'status': 'FAILED', 'voltage': None})
+                        else:
+                            try:
+                                v = float(volts_val)
+                                self.ssh_history.append({'timestamp': ts, 'status': 'SUCCESS', 'voltage': v})
+                                metric = self.metrics_manager.get_metric('ssh_voltage')
+                                if metric:
+                                    metric.data_history.append({'timestamp': ts, 'value': v})
+                            except Exception:
+                                pass
+
+                    # metrics
+                    def _add_metric(name, token_key, cast=float):
+                        val = tokens.get(token_key)
+                        if val is None:
+                            return
+                        try:
+                            v = cast(val)
+                        except Exception:
+                            return
+                        metric = self.metrics_manager.get_metric(name)
+                        if metric:
+                            metric.data_history.append({'timestamp': ts, 'value': v})
+
+                    _add_metric('terahash', 'th', float)
+                    _add_metric('temperature', 'temp', float)
+                    _add_metric('frequency', 'freq', float)
+                    _add_metric('fan_speed', 'fan', float)
+                    _add_metric('power', 'watts', float)
+                    _add_metric('efficiency', 'w/th', float)
+
+            # Update counters crudely from ping/ssh histories
+            self.total_pings = len(self.ping_history)
+            self.successful_pings = sum(1 for e in self.ping_history if e['status'] == 'UP')
+            self.total_ssh = len(self.ssh_history)
+            self.successful_ssh = sum(1 for e in self.ssh_history if e['status'] == 'SUCCESS')
+        except Exception:
+            pass
 
     def on_window_resize(self, event):
         """Handle window resize to update graph canvas"""
