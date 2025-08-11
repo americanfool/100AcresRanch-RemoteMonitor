@@ -1,4 +1,4 @@
-# HashBox Remote Monitor
+# Unoffical HashBox Remote Monitor
 Requires Python!
 A real-time network monitoring application that tracks ping status and SSH voltage readings with historical data visualization for remote HashBox systems.
 
