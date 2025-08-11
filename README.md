@@ -1,5 +1,5 @@
 # HashBox Remote Monitor
-
+Requires Python!
 A real-time network monitoring application that tracks ping status and SSH voltage readings with historical data visualization for remote HashBox systems.
 
 ## Features
@@ -64,8 +64,6 @@ The application automatically creates `heartbeat_config.json` on first run with 
 ### Application Settings
 - **Close to System Tray**: Whether to hide app to tray when closed
 
-> **Note**: `heartbeat_config.json` contains your personal settings and is ignored by git.
-
 ## Files
 
 - `heartbeat_monitor.py` - Main monitoring application with tray support
@@ -74,6 +72,6 @@ The application automatically creates `heartbeat_config.json` on first run with 
 - `requirements.txt` - Python dependencies
 - `README.md` - This documentation
 
-### Auto-Generated Files (ignored by git)
+### Auto-Generated Files
 - `heartbeat_config.json` - User configuration (created on first run)
 - `events_log.txt` - Event log (created during monitoring) 
